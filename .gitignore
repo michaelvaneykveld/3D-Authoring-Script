@@ -1,0 +1,21 @@
+# Python
+**/__pycache__/
+*.py[cod]
+
+# Virtual Environment
+/.venv/
+/venv/
+/env/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+
+# Project-specific temporary files & outputs
+*.264
+*.ts
+*.mkv
+*.iso
+*.sup
+*.srt
+*.meta
