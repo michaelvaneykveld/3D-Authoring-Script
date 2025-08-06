@@ -134,8 +134,9 @@ def main():
 
         # Get a name for the project to create a dedicated subfolder, preventing permission errors.
         base_name = os.path.splitext(os.path.basename(source_file))[0]
-        # Sanitize the base_name to be a valid folder name
-        sanitized_base_name = re.sub(r'[\\/*?:"<>|]', "", base_name)
+        # Sanitize the base_name to be a valid folder name.
+        # Replace spaces with underscores and remove other invalid characters.
+        sanitized_base_name = re.sub(r'[\\/*?:"<>| ]', "_", base_name)
         project_name = input(f"Enter a name for the Blu-ray output folder (press Enter to use '{sanitized_base_name}'): ").strip()
         if not project_name:
             project_name = sanitized_base_name

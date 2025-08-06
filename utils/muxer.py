@@ -31,16 +31,19 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
     """
     print("\n--- Starting Step 2: Muxing to Blu-ray 3D ---")
 
+    # --- Normalize work_dir to use forward slashes to prevent mixed separators ---
+    work_dir = work_dir.replace('\\', '/')
+
     # --- Define all paths ---
-    left_eye_path = os.path.join(work_dir, 'left_eye.264')
+    left_eye_path = f"{work_dir}/left_eye.264"
     # Find all the dependent view chunk files, sorted numerically
     dep_chunk_files = sorted(
-        [os.path.join(work_dir, f) for f in os.listdir(work_dir) if f.startswith('temp_chunk_') and f.endswith('_dep.264')],
+        [f"{work_dir}/{f}" for f in os.listdir(work_dir) if f.startswith('temp_chunk_') and f.endswith('_dep.264')],
         key=lambda x: int(re.search(r'temp_chunk_(\d+)_dep\.264', x).group(1))
     )
-    clean_source_path = os.path.join(work_dir, 'clean_remux_for_audio.mkv')
-    final_meta_path = os.path.join(work_dir, 'muxer_final.meta')
-    tsmuxer_log_path = os.path.join(work_dir, 'tsmuxer_output.log')
+    clean_source_path = f"{work_dir}/clean_remux_for_audio.mkv"
+    final_meta_path = f"{work_dir}/muxer_final.meta"
+    tsmuxer_log_path = f"{work_dir}/tsmuxer_output.log"
 
     # This list will hold paths to all temporary files and folders for final cleanup
     files_to_cleanup = [final_meta_path, tsmuxer_log_path, clean_source_path, left_eye_path] + dep_chunk_files
@@ -80,6 +83,7 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         print("\n--- Step 2b: Extracting clean elementary streams for tsMuxeR ---")
         audio_track_lines_for_meta = []
         subtitle_track_lines_for_meta = []
+        meta_input_files = [] # Will hold all audio/sub file paths for pre-flight check
 
         if clean_source_path and os.path.exists(clean_source_path):
             extracted_streams_to_cleanup = []
@@ -87,9 +91,10 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
             for i, stream in enumerate(audio_streams):
                 ts_codec = TSMUXER_CODEC_MAP.get(stream['codec'])
                 if not ts_codec: continue
-                temp_audio_path = os.path.join(work_dir, f'clean_audio_{i}.{stream["codec"]}')
+                temp_audio_path = f'{work_dir}/clean_audio_{i}.{stream["codec"]}'
                 ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', clean_source_path, '-map', f'0:a:{i}', '-c', 'copy', temp_audio_path]
                 subprocess.run(ffmpeg_cmd, check=True)
+                meta_input_files.append(temp_audio_path)
                 extracted_streams_to_cleanup.append(temp_audio_path)
                 audio_track_lines_for_meta.append(f'{ts_codec}, "{temp_audio_path}", lang={stream["lang"]}')
 
@@ -99,10 +104,11 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
                 ts_codec = TSMUXER_CODEC_MAP.get(stream_codec)
                 if not ts_codec: continue
                 file_extension = 'srt' if stream_codec == 'subrip' else 'sup'
-                temp_sub_path = os.path.join(work_dir, f'clean_sub_{i}.{file_extension}')
+                temp_sub_path = f'{work_dir}/clean_sub_{i}.{file_extension}'
                 subtitle_index_in_remux = len(audio_streams) + i
                 ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', clean_source_path, '-map', f'0:{subtitle_index_in_remux}', '-c', 'copy', temp_sub_path]
                 subprocess.run(ffmpeg_cmd, check=True)
+                meta_input_files.append(temp_sub_path)
                 extracted_streams_to_cleanup.append(temp_sub_path)
                 track_line = f'{ts_codec}, "{temp_sub_path}", lang={stream["lang"]}'
                 if stream_codec == 'subrip':
@@ -143,13 +149,43 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         final_meta_content.extend(audio_track_lines_for_meta)
         final_meta_content.extend(subtitle_track_lines_for_meta)
 
+        # --- Pre-flight check for all input files before calling tsMuxeR ---
+        print("\n  [i] Verifying all source files for the muxer exist and are valid...")
+        all_files_ok = True
+        files_to_check_in_meta = [left_eye_path] + dep_chunk_files + meta_input_files
+        for f_path in files_to_check_in_meta:
+            if not os.path.exists(f_path):
+                print(f"  [✗] FATAL: Input file for meta does not exist: {os.path.basename(f_path)}", file=sys.stderr)
+                all_files_ok = False
+            elif os.path.getsize(f_path) == 0:
+                print(f"  [✗] FATAL: Input file for meta is empty (0 bytes): {os.path.basename(f_path)}", file=sys.stderr)
+                all_files_ok = False
+        if not all_files_ok:
+            raise IOError("Aborting mux due to missing or empty input files. This indicates a failure in a previous step (encoding or track extraction).")
+        print("  [✓] All source files are present and valid.")
+
+        print("\n--- Generated .meta file content ---")
+        print('\n'.join(final_meta_content))
+        print("-" * 34)
+
         with open(final_meta_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(final_meta_content))
+            # Ensure the file ends with a newline for tsMuxeR compatibility.
+            f.write('\n'.join(final_meta_content) + '\n')
         
-        # Ensure the final output directory exists before running tsMuxeR.
-        if output_path:
-            os.makedirs(output_path, exist_ok=True)
-            print(f"  [i] Ensured output directory exists: {output_path}")
+        # --- Proactively create the entire BDMV directory structure ---
+        # This prevents partial creation issues and also acts as a write permission check.
+        print("  [i] Proactively creating required BDMV directory structure...")
+        required_subdirs = [
+            os.path.join(output_path, "BDMV", "STREAM"),
+            os.path.join(output_path, "BDMV", "PLAYLIST"),
+            os.path.join(output_path, "BDMV", "CLIPINF"),
+            os.path.join(output_path, "BDMV", "BACKUP", "PLAYLIST"),
+            os.path.join(output_path, "BDMV", "BACKUP", "CLIPINF"),
+            os.path.join(output_path, "CERTIFICATE")
+        ]
+        for subdir in required_subdirs:
+            os.makedirs(subdir, exist_ok=True)
+        print(f"  [✓] Ensured output directory structure exists at: {os.path.normpath(output_path)}")
 
         print(f"  [i] Running tsMuxeR. Output will be logged to: {os.path.basename(tsmuxer_log_path)}")
         # Normalize paths for better cross-platform compatibility and to avoid mixed slashes.
@@ -176,7 +212,24 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
     except (IOError, subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
         print("\nFATAL ERROR: Muxing process failed.", file=sys.stderr)
         print(f"Error details: {e}", file=sys.stderr)
-        print(f"\n[!] The detailed tsMuxeR log has been preserved for debugging at:\n    {tsmuxer_log_path}", file=sys.stderr)
+
+        # --- Enhanced Error Analysis ---
+        # Check the log for the specific "Can't create file" error, which often
+        # indicates a permissions issue with Windows Controlled Folder Access.
+        if os.path.exists(tsmuxer_log_path):
+            with open(tsmuxer_log_path, 'r', encoding='utf-8') as log_file:
+                log_content = log_file.read()
+                if "Can't create file" in log_content:
+                    print("\n--- [!] Potential Permission Issue Detected ---", file=sys.stderr)
+                    print("The error 'Can't create file' strongly suggests that tsMuxeR is being blocked", file=sys.stderr)
+                    print("by a security feature, most likely Windows 'Controlled Folder Access'.", file=sys.stderr)
+                    print("\nRecommended Solutions:", file=sys.stderr)
+                    print("  1. (Best) Rerun the script and choose a different PARENT directory for the final output,", file=sys.stderr)
+                    print("     such as the root of a drive (e.g., 'C:\\' or 'D:\\') or a non-system folder.", file=sys.stderr)
+                    print("  2. (Advanced) Add 'tsMuxeR.exe' to the list of allowed apps in your Windows", file=sys.stderr)
+                    print("     Security settings under 'Virus & threat protection' > 'Ransomware protection'.", file=sys.stderr)
+
+        print(f"\n[!] The detailed tsMuxeR log has been preserved for debugging at:\n    {os.path.normpath(tsmuxer_log_path)}", file=sys.stderr)
         sys.exit(1)
     finally:
         # --- Cleanup of internal temporary files ---
