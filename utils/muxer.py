@@ -2,6 +2,7 @@ import subprocess
 import os
 import shutil
 import sys
+import re
 import time
 
 TSMUXER_CODEC_MAP = {
@@ -31,17 +32,20 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
     print("\n--- Starting Step 2: Muxing to Blu-ray 3D ---")
 
     # --- Define all paths ---
-    video_3d_mkv_path = os.path.join(work_dir, 'video_3d.mkv')
     left_eye_path = os.path.join(work_dir, 'left_eye.264')
-    right_eye_path = os.path.join(work_dir, 'right_eye.264')
-    clean_source_path = os.path.join(work_dir, 'clean_remux.mkv')
+    # Find all the dependent view chunk files, sorted numerically
+    dep_chunk_files = sorted(
+        [os.path.join(work_dir, f) for f in os.listdir(work_dir) if f.startswith('temp_chunk_') and f.endswith('_dep.264')],
+        key=lambda x: int(re.search(r'temp_chunk_(\d+)_dep\.264', x).group(1))
+    )
+    clean_source_path = os.path.join(work_dir, 'clean_remux_for_audio.mkv')
     final_meta_path = os.path.join(work_dir, 'muxer_final.meta')
 
     # This list will hold paths to all temporary files and folders for final cleanup
-    files_to_cleanup = [final_meta_path, clean_source_path, video_3d_mkv_path, left_eye_path, right_eye_path]
+    files_to_cleanup = [final_meta_path, clean_source_path, left_eye_path] + dep_chunk_files
 
-    if not os.path.exists(video_3d_mkv_path):
-        print(f"ERROR: Encoded 3D MKV stream not found in {work_dir}", file=sys.stderr)
+    if not os.path.exists(left_eye_path) or not dep_chunk_files:
+        print(f"ERROR: Encoded .264 stream files not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -101,19 +105,8 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
             print("  [✓] All selected audio/subtitle streams extracted successfully.")
             files_to_cleanup.extend(extracted_streams_to_cleanup)
 
-        # --- Step 2c: Extract synchronized elementary streams using the reliable mkvextract tool ---
-        print("\n--- Step 2c: Extracting synchronized elementary streams from 3D MKV ---")
-        try:
-            # mkvextract is the industry standard for reliably extracting tracks from MKV
-            # without introducing timing errors, which is a known issue with ffmpeg's -c copy.
-            # The syntax is: mkvextract tracks <source_mkv> <trackID>:"<output_file>"
-            mkvextract_cmd = ['mkvextract', 'tracks', video_3d_mkv_path, f'0:"{left_eye_path}"', f'1:"{right_eye_path}"']
-            subprocess.run(mkvextract_cmd, check=True, shell=True) # shell=True helps with path quoting on Windows
-            print("  [✓] Synchronized elementary streams extracted successfully.")
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"ERROR: Failed to extract video streams using mkvextract: {e}", file=sys.stderr)
-            print("Please ensure MKVToolNix is installed and 'mkvextract.exe' is in your PATH.", file=sys.stderr)
-            sys.exit(1)
+        print("\n--- Step 2c: Locating pre-encoded .264 streams ---")
+        print("  [✓] Found synchronized .264 streams.")
 
         # --- Step 2d: Final Mux - Combine all elementary streams ---
         print("\n--- Step 2d: Muxing all streams into the final Blu-ray structure ---")
@@ -124,12 +117,18 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         if chapters:
             final_mux_options.append(f'--custom-chapters={";".join(chapters)}')
 
+        # Use decimal representation to ensure consistency with the encoder.
+        fps_for_muxer = f"{properties.get('fps_float', 23.976):.3f}"
+        # Format the dependent view files for the meta file string, e.g., "file1"+"file2"
+        right_eye_files_str = '+'.join([f'"{f}"' for f in dep_chunk_files])
+
         final_meta_content = [
             f'MUXOPT {" ".join(final_mux_options)}',
-            # Per your research, we are removing 'insertSEI' and 'contSPS' to prevent
-            # tsMuxeR from modifying the already compliant stream from ffmpeg.
-            f'V_MPEG4/ISO/AVC, "{left_eye_path}", ssif',
-            f'V_MPEG4/ISO/AVC, "{right_eye_path}", subTrack, mvc',
+            # Add the two separate AVC streams. The 'ssif' flag on the left eye
+            # identifies it as the base view for a 3D presentation. The 'mvc' flag
+            # on the right eye identifies it as the dependent view.
+            f'V_MPEG4/ISO/AVC, "{left_eye_path}", fps={fps_for_muxer}, insertSEI, contSPS, ssif',
+            f'V_MPEG4/ISO/AVC, {right_eye_files_str}, mvc, fps={fps_for_muxer}',
         ]
         
         final_meta_content.extend(audio_track_lines_for_meta)

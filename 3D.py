@@ -5,8 +5,9 @@ import shutil
 from utils.file_selector import select_source_file, select_output_directory, select_output_iso, ask_yes_no
 from utils.video_analyzer import analyze_video
 from utils.track_selector import select_tracks
-from utils.encoder import process_with_nvenc
+from utils.encoder import create_3d_video_streams
 from utils.muxer import create_bluray_structure
+from utils.bdmv_validator import validate_bdmv_structure
 
 def run_dependency_check():
     """
@@ -17,15 +18,22 @@ def run_dependency_check():
 
     print("--- Running Dependency Check ---")
     try:
-        # Run the checker script using the same Python interpreter.
-        # 'check=True' will raise a CalledProcessError if the script returns a non-zero exit code.
-        subprocess.run([sys.executable, checker_script_path], check=True)
+        # A simple, direct call is now sufficient. The checker script will print
+        # all necessary information and exit with an error if something is wrong.
+        subprocess.run(
+            [sys.executable, checker_script_path],
+            check=True,
+            text=True,
+            encoding='utf-8'
+        )
         print("--- Dependency Check Passed ---\n")
     except FileNotFoundError:
         print(f"ERROR: Dependency check script not found at '{checker_script_path}'")
         sys.exit(1)
     except subprocess.CalledProcessError:
-        print("\n--- Dependency Check Failed. Aborting execution. ---")
+        # The checker script now prints its own detailed error messages.
+        # We just need to inform the user that the script is aborting.
+        print("\n--- Aborting due to missing dependencies. Please review the messages above. ---")
         sys.exit(1)
 
 # --- Main application logic starts here ---
@@ -37,7 +45,7 @@ source_file = select_source_file()
 
 # If no file is selected (dialog is canceled), exit the program.
 if not source_file:
-    print("No source file selected. Aborting.")
+    print("No source file selected. Aborting script.")
     sys.exit(1)
 
 print(f"Successfully selected source file: {source_file}")
@@ -69,13 +77,13 @@ print(f"  {'Subtitle Streams Found:':<28}{len(video_properties.get('subtitle_str
 # Allow the user to select which tracks to keep
 video_properties = select_tracks(video_properties)
 
-# --- User Confirmation Step ---
+# --- User Confirmation ---
 analysis_summary = (
     "The video analysis is complete. Please review the details in the console.\n\n"
     f"A {video_properties['sbs_type']} video will be converted to a Blu-ray 3D structure.\n"
     f"Active video area is {video_properties['active_width']}x{video_properties['active_height']}.\n"
     f"You have selected {len(video_properties.get('audio_streams', []))} audio and {len(video_properties.get('subtitle_streams', []))} subtitle tracks to include.\n\n"
-    "Press 'Yes' to continue or 'No' to abort."
+    "Press 'Yes' to continue with encoding and muxing, or 'No' to abort."
 )
 
 confirmed = ask_yes_no(
@@ -83,15 +91,15 @@ confirmed = ask_yes_no(
     message=analysis_summary
 )
 if not confirmed:
-    print("Aborting as requested by user.")
+    print("Aborting script as requested by user.")
     sys.exit(0)
 else:
     print("Confirmation received. Continuing with the process...")
 
 # --- Step 1: Encoding ---
 
-# Ask for a temporary working directory
-print("\nA dialog will now open to select a TEMPORARY working directory for encoded files...")
+# Ask for a temporary working directory for intermediate files
+print("\nA dialog will now open to select a TEMPORARY working directory...")
 work_dir = select_output_directory()
 if not work_dir:
     print("No working directory selected. Aborting.")
@@ -99,46 +107,58 @@ if not work_dir:
 print(f"Temporary files will be saved to: {work_dir}")
 
 # --- Check for existing encoded files to potentially skip encoding ---
-video_3d_mkv_path = os.path.join(work_dir, 'video_3d.mkv')
+left_eye_path = os.path.join(work_dir, 'left_eye.264')
+dep_chunks_exist = False
+if os.path.isdir(work_dir):
+    dep_chunks_exist = any(f.startswith('temp_chunk_') and f.endswith('_dep.264') for f in os.listdir(work_dir))
+
 skip_encoding = False
 files_exist_and_are_valid = (
-    os.path.exists(video_3d_mkv_path) and os.path.getsize(video_3d_mkv_path) > 0
+    os.path.exists(left_eye_path) and os.path.getsize(left_eye_path) > 0 and dep_chunks_exist
 )
 
 if files_exist_and_are_valid:
-    print("\n[i] Found existing, valid encoded 3D MKV stream in the temporary directory.")
+    print("\n[i] Found existing, valid encoded 3D .264 streams in the temporary directory.")
     use_existing = ask_yes_no(
         title="Existing Files Found",
-        message="Found a pre-encoded 3D MKV stream. Do you want to skip the encoding step and use this file?"
+        message="Pre-encoded 3D .264 streams were found. Do you want to skip the encoding step and use these existing files?"
     )
     if use_existing:
         print("--- Skipping Step 1: Encoding. Using existing files. ---")
         skip_encoding = True
     else:
         print("--- Proceeding with re-encoding as requested. ---")
-elif os.path.exists(video_3d_mkv_path):
-    # This case handles when files exist but are empty (e.g., from a failed run)
+elif os.path.exists(left_eye_path) or dep_chunks_exist:
+    # This case handles when the file exists but is empty (e.g., from a previously failed run)
     print("\n[!] Found existing but potentially corrupt (empty) encoded files. Forcing re-encoding.")
 
 if not skip_encoding:
     # Run the encoder
-    process_with_nvenc(source_file, video_properties, work_dir)
+    create_3d_video_streams(source_file, video_properties, work_dir)
 
 # --- Step 2: Muxing ---
 
 # Ask for final output ISO path
-print("\nA dialog will now open to select the FINAL output location and name for the Blu-ray ISO file...")
-output_iso_path = select_output_iso()
-if not output_iso_path:
-    print("No output file selected. Aborting.")
+print("\nA dialog will now open to select the FINAL output location for the Blu-ray folder structure...")
+output_bdmv_path = select_output_directory(title="Select Final Blu-ray Output Folder")
+if not output_bdmv_path:
+    print("No output folder selected. Aborting.")
     sys.exit(1)
-print(f"Final Blu-ray ISO will be saved as: {output_iso_path}")
+print(f"Final Blu-ray folder structure will be saved in: {output_bdmv_path}")
 
 # Run the muxer
-create_bluray_structure(video_properties, source_file, work_dir, output_iso_path)
+create_bluray_structure(video_properties, source_file, work_dir, output_bdmv_path)
 
-print("\n--- Process Complete! ---")
-print(f"The Blu-ray 3D ISO has been successfully created at:\n{output_iso_path}")
+# --- Step 3: Post-Mux Validation ---
+print("\n--- Starting Post-Mux Validation ---")
+validation_passed = validate_bdmv_structure(output_bdmv_path)
+
+if validation_passed:
+    print("\n--- Validation Successful ---")
+    print(f"The Blu-ray 3D folder structure at:\n{output_bdmv_path}\nappears to be valid and compliant.")
+else:
+    print("\n--- Validation Failed ---")
+    print("The generated Blu-ray structure has issues. Please review the validation log above.")
 
 # --- Final Cleanup Step ---
 cleanup = ask_yes_no(

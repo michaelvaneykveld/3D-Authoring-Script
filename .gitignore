@@ -19,3 +19,7 @@
 *.sup
 *.srt
 *.meta
+
+# Compiled/Source files from other languages
+*.cpp
+*.h
