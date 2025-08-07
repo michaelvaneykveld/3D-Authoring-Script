@@ -128,7 +128,7 @@ def create_3d_video_streams(source_file, properties, output_dir):
     # --- Main processing loop ---
     num_chunks = (total_frames + CHUNK_SIZE_FRAMES - 1) // CHUNK_SIZE_FRAMES
     base_chunk_files = []
-    dep_chunk_files = []
+    combined_chunk_files = []
 
     for i in range(num_chunks):
         start_frame = i * CHUNK_SIZE_FRAMES
@@ -140,10 +140,8 @@ def create_3d_video_streams(source_file, properties, output_dir):
         # Define temporary file paths for this specific chunk
         left_chunk_yuv = os.path.join(output_dir, f'temp_chunk_{i}_left.yuv')
         right_chunk_yuv = os.path.join(output_dir, f'temp_chunk_{i}_right.yuv')
-        base_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_base.264')
-        dep_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_dep.264')
-        base_chunk_files.append(base_chunk_264)
-        dep_chunk_files.append(dep_chunk_264)
+        combined_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_combined.264')
+        combined_chunk_files.append(combined_chunk_264)
         try:
             # --- Step 1: Extract YUV chunks with ffmpeg ---
             ffmpeg_cmd_left = [
@@ -169,8 +167,7 @@ def create_3d_video_streams(source_file, properties, output_dir):
             frim_cmd = [
                 'FRIMEncode64',
                 '-i', left_chunk_yuv, right_chunk_yuv,
-                '-o:mvc', base_chunk_264, dep_chunk_264,
-                '-viewoutput', # CRITICAL: Instructs FRIM to create two separate files
+                '-o:mvc', combined_chunk_264, # A single output file containing both views
                 '-w', '1920', '-h', '1080',
                 # Use decimal representation for framerate to ensure consistency
                 # between the encoder and the muxer, preventing conflicts.
@@ -203,22 +200,17 @@ def create_3d_video_streams(source_file, properties, output_dir):
                     os.remove(f)
     
     # --- Step 3 (Post-Loop): Concatenate chunks into final streams ---
-    print("\n--- Concatenating all chunks into final streams ---")
-    final_base_path = os.path.join(output_dir, 'left_eye.264')
-    _concatenate_chunks(base_chunk_files, final_base_path)
-    
-    final_dep_path = os.path.join(output_dir, 'right_eye.264')
-    _concatenate_chunks(dep_chunk_files, final_dep_path)
+    print("\n--- Concatenating all chunks into a final combined 3D stream ---")
+    final_combined_path = os.path.join(output_dir, 'video_3d.264')
+    _concatenate_chunks(combined_chunk_files, final_combined_path)
 
     # --- Final Verification ---
-    if not _verify_stream_with_ffprobe(final_base_path, "left eye (base view)"):
-        print("Aborting due to stream verification failure.", file=sys.stderr)
-        sys.exit(1)
-    
-    if not _verify_stream_with_ffprobe(final_dep_path, "right eye (dependent view)", is_dependent_view=True):
+    # The most reliable verification for the combined stream is tsMuxeR itself.
+    # We will simply verify the base view properties within the combined stream.
+    if not _verify_stream_with_ffprobe(final_combined_path, "combined 3D stream (base view properties)"):
         print("Aborting due to stream verification failure.", file=sys.stderr)
         sys.exit(1)
 
     print("\n--- 3D streams created successfully! ---")
-    print(f"You can find the final .264 files in: {output_dir}")
+    print(f"You can find the final combined .264 file in: {output_dir}")
     print("\nEncoding complete. Proceeding to muxing stage...")

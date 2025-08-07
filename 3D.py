@@ -39,12 +39,9 @@ def run_dependency_check():
 
 def should_skip_encoding(work_dir: str) -> bool:
     """Checks for existing, valid encoded files to determine if encoding can be skipped."""
-    left_eye_path = os.path.join(work_dir, 'left_eye.264')
-    right_eye_path = os.path.join(work_dir, 'right_eye.264')
+    video_3d_path = os.path.join(work_dir, 'video_3d.264')
 
-    files_exist_and_are_valid = (
-        os.path.exists(left_eye_path) and os.path.getsize(left_eye_path) > 0 and os.path.exists(right_eye_path) and os.path.getsize(right_eye_path) > 0
-    )
+    files_exist_and_are_valid = os.path.exists(video_3d_path) and os.path.getsize(video_3d_path) > 0
 
     if files_exist_and_are_valid:
         print("\n[i] Found existing, valid encoded 3D .264 streams in the temporary directory.")
@@ -57,7 +54,7 @@ def should_skip_encoding(work_dir: str) -> bool:
             return True
         else:
             print("--- Proceeding with re-encoding as requested. ---")
-    elif os.path.exists(left_eye_path) or os.path.exists(right_eye_path):
+    elif os.path.exists(video_3d_path):
         # This case handles when the file exists but is empty (e.g., from a previously failed run)
         print("\n[!] Found existing but potentially corrupt (empty) encoded files. Forcing re-encoding.")
     
