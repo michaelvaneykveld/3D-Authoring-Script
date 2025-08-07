@@ -2,6 +2,9 @@ import sys
 import subprocess
 import os
 import json
+from datetime import datetime
+import shlex
+import hashlib
 import shutil
 
 def _verify_stream_with_ffprobe(stream_path, eye_name, is_dependent_view=False):
@@ -102,6 +105,63 @@ def _concatenate_chunks(chunk_files, final_output_path):
             if os.path.exists(f):
                 os.remove(f)
 
+def _contains_mvc_nal_units(path):
+    """
+    Scans a binary file for the presence of MVC-specific NAL unit headers.
+    This is a strong indicator that the stream is a proper MVC-encoded 3D stream.
+    """
+    print("\n--- Verifying for MVC NAL units in combined stream ---")
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        # MVC streams use specific NAL unit types: 15 (subset SPS) and 20 (coded slice extension).
+        # We search for the byte sequences for these NAL units.
+        # Start code + NAL unit type 15: 00 00 01 0F
+        # Start code + NAL unit type 20: 00 00 01 14
+        if b'\x00\x00\x01\x0f' in data or b'\x00\x00\x01\x14' in data:
+            print("  [✓] SUCCESS: MVC-specific NAL units found in the stream.")
+            return True
+        else:
+            print("  [✗] FAILURE: No MVC-specific NAL units (type 15 or 20) found.", file=sys.stderr)
+            print("      The stream is likely not a compliant stereoscopic 3D stream.", file=sys.stderr)
+            return False
+    except IOError as e:
+        print(f"  [✗] ERROR: Could not read file to check for NAL units: {e}", file=sys.stderr)
+        return False
+
+def _verify_yuv_difference(left_yuv_path, right_yuv_path):
+    """
+    Verifies that the two YUV files are not identical by comparing their hashes.
+    This prevents FRIMEncode from failing to create an MVC stream with identical inputs.
+    """
+    print("\n--- Verifying difference between Left and Right YUV chunks ---")
+    try:
+        hasher_left = hashlib.sha256()
+        hasher_right = hashlib.sha256()
+
+        with open(left_yuv_path, 'rb') as f_left:
+            buf = f_left.read(65536)
+            while len(buf) > 0:
+                hasher_left.update(buf)
+                buf = f_left.read(65536)
+        
+        with open(right_yuv_path, 'rb') as f_right:
+            buf = f_right.read(65536)
+            while len(buf) > 0:
+                hasher_right.update(buf)
+                buf = f_right.read(65536)
+
+        if hasher_left.hexdigest() == hasher_right.hexdigest():
+            print("  [✗] FATAL: Left and Right YUV chunks are identical.", file=sys.stderr)
+            print("      This will cause FRIMEncode to fail creating a 3D stream. Check source video.", file=sys.stderr)
+            return False
+        else:
+            print("  [✓] SUCCESS: Left and Right YUV chunks are different.")
+            return True
+    except IOError as e:
+        print(f"  [✗] ERROR: Could not read YUV files for verification: {e}", file=sys.stderr)
+        return False
+
 def create_3d_video_streams(source_file, properties, output_dir):
     """
     Creates Blu-ray 3D compliant streams by processing the video in chunks
@@ -112,6 +172,9 @@ def create_3d_video_streams(source_file, properties, output_dir):
 
     # --- Configuration ---
     CHUNK_SIZE_FRAMES = 300  # Number of frames to process per chunk.
+
+    # --- Define log path for this process ---
+    encoder_log_path = os.path.join(output_dir, 'encoder_process.log')
 
     # --- Get properties ---
     total_frames = properties.get('total_frames')
@@ -130,6 +193,13 @@ def create_3d_video_streams(source_file, properties, output_dir):
     base_chunk_files = []
     combined_chunk_files = []
 
+    # Initialize the log file for this encoding session
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(encoder_log_path, 'w', encoding='utf-8') as log:
+        log.write(f"--- Encoder Process Log ({timestamp}) ---\n")
+        log.write(f"Source: {source_file}\n")
+        log.write(f"Properties: {json.dumps(properties, indent=2)}\n")
+
     for i in range(num_chunks):
         start_frame = i * CHUNK_SIZE_FRAMES
         frames_in_this_chunk = min(CHUNK_SIZE_FRAMES, total_frames - start_frame)
@@ -145,22 +215,36 @@ def create_3d_video_streams(source_file, properties, output_dir):
         try:
             # --- Step 1: Extract YUV chunks with ffmpeg ---
             ffmpeg_cmd_left = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'info',
                 '-ss', str(start_time_sec), '-i', source_file,
                 '-frames:v', str(frames_in_this_chunk),
                 '-vf', f"crop={crop_w}:{crop_h}:0:{crop_y},crop={eye_w}:{crop_h}:0:0,pad=1920:1080:-1:-1,setsar=1",
                 '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p', left_chunk_yuv
             ]
-            subprocess.run(ffmpeg_cmd_left, check=True)
+            with open(encoder_log_path, 'a', encoding='utf-8') as log:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                command_str = shlex.join(ffmpeg_cmd_left)
+                log.write(f"\n--- Chunk {i+1}/{num_chunks} - Extracting Left YUV ({timestamp}) ---\n")
+                log.write(f"COMMAND: {command_str}\n\n")
+                subprocess.run(ffmpeg_cmd_left, check=True, stdout=log, stderr=subprocess.STDOUT)
 
             ffmpeg_cmd_right = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'info',
                 '-ss', str(start_time_sec), '-i', source_file,
                 '-frames:v', str(frames_in_this_chunk),
                 '-vf', f"crop={crop_w}:{crop_h}:0:{crop_y},crop={eye_w}:{crop_h}:{eye_w}:0,pad=1920:1080:-1:-1,setsar=1",
                 '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p', right_chunk_yuv
             ]
-            subprocess.run(ffmpeg_cmd_right, check=True)
+            with open(encoder_log_path, 'a', encoding='utf-8') as log:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                command_str = shlex.join(ffmpeg_cmd_right)
+                log.write(f"\n--- Chunk {i+1}/{num_chunks} - Extracting Right YUV ({timestamp}) ---\n")
+                log.write(f"COMMAND: {command_str}\n\n")
+                subprocess.run(ffmpeg_cmd_right, check=True, stdout=log, stderr=subprocess.STDOUT)
+
+            # --- Verify YUV difference ---
+            if not _verify_yuv_difference(left_chunk_yuv, right_chunk_yuv):
+                raise IOError("YUV chunk verification failed: Left and Right views are identical.")
 
             # --- Step 2: Encode YUV chunks with FRIM ---
             print(f"  [1/1] Encoding chunk {i+1} with FRIM...")
@@ -168,7 +252,7 @@ def create_3d_video_streams(source_file, properties, output_dir):
                 'FRIMEncode64',
                 '-i', left_chunk_yuv, right_chunk_yuv,
                 '-o:mvc', combined_chunk_264, # A single output file containing both views
-                '-w', '1920', '-h', '1080',
+                '-w', '1920', '-h', '1080', 
                 # Use decimal representation for framerate to ensure consistency
                 # between the encoder and the muxer, preventing conflicts.
                 '-f', f"{fps_float:.3f}",
@@ -176,21 +260,55 @@ def create_3d_video_streams(source_file, properties, output_dir):
                 '-cqp', '22', '22', '22',
                 '-profile', 'high',
                 '-level', '4.1',
-                # Set GOP distance to 1 to disable B-frames entirely. This is a more
-                # forceful way to ensure B-pyramids are not used, which is the
-                # root cause of the Blu-ray 3D incompatibility.
-                '-gop', str(gop_length), '1', '0', 'C',
-                # CRITICAL FIX: Disable FRIM's VUI/SEI generation. This creates a "cleaner"
-                # stream and prevents framerate conflicts inside tsMuxeR, which will
-                # be responsible for injecting its own compliant headers.
-                '-VuiNalHrd', 'off',
-                '-PicTimingSEI', 'off',
+                # Let FRIMEncode handle the VUI and SEI timing information.
+                # This is often more stable than letting tsMuxeR inject it later,
+                # preventing the DTS timing jump errors.
+                '-VuiNalHrd', 'on',
+                '-PicTimingSEI', 'on',
                 '-Bpyramid', 'off', # CRITICAL: Disable B-pyramids for Blu-ray 3D compliance
             ]
-            subprocess.run(frim_cmd, check=True)
+            frim_output = ""
+            with open(encoder_log_path, 'a', encoding='utf-8') as log:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                command_str = shlex.join(frim_cmd)
+                log.write(f"\n--- Chunk {i+1}/{num_chunks} - Encoding with FRIM ({timestamp}) ---\n")
+                log.write(f"COMMAND: {command_str}\n\n")
+                # Capture output to check for MVC mode, while also logging it
+                process = subprocess.run(frim_cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                log.write(process.stdout)
+                log.write(process.stderr)
+                frim_output = process.stdout + process.stderr
+            
+            # --- Check for warnings and dropped frames in FRIM output ---
+            warnings = [line for line in frim_output.splitlines() if "WARNING:" in line]
+            if warnings:
+                print("  [!] WARNINGS found in FRIMEncode output:")
+                for warning in warnings:
+                    print(f"      - {warning.strip()}")
 
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"ERROR: Failed during processing of chunk {i+1}: {e}", file=sys.stderr)
+            frame_issues = [line for line in frim_output.splitlines() if "dropped frame" in line or "duplicate frame" in line]
+            if frame_issues:
+                print("  [!] Dropped/Duplicate frames reported by FRIMEncode:")
+                for issue in frame_issues:
+                    print(f"      - {issue.strip()}")
+
+            if "Encoder MVC" not in frim_output:
+                print("  [✗] FATAL: FRIMEncode did not report entering MVC mode. The output is not 3D.", file=sys.stderr)
+                raise IOError("FRIMEncode failed to create an MVC stream.")
+
+            # --- Verify chunk creation ---
+            if not os.path.exists(combined_chunk_264) or os.path.getsize(combined_chunk_264) == 0:
+                print(f"  [✗] FATAL: FRIMEncode failed to create a valid output chunk for chunk {i+1}.", file=sys.stderr)
+                print(f"      Expected file: {combined_chunk_264}", file=sys.stderr)
+                raise IOError("FRIMEncode chunk creation failed.")
+
+        except (subprocess.CalledProcessError, FileNotFoundError, IOError) as e:
+            # Provide a more specific error message for non-zero exit codes
+            if isinstance(e, subprocess.CalledProcessError):
+                print(f"ERROR: A critical error occurred during encoding (exit code {e.returncode}).", file=sys.stderr)
+            else:
+                print(f"ERROR: Failed during processing of chunk {i+1}: {e}", file=sys.stderr)
+            print(f"      Check the detailed encoder log for the full output: {encoder_log_path}", file=sys.stderr)
             sys.exit(1)
         finally:
             # --- Step 4: Clean up temporary chunk files ---
@@ -205,6 +323,11 @@ def create_3d_video_streams(source_file, properties, output_dir):
     _concatenate_chunks(combined_chunk_files, final_combined_path)
 
     # --- Final Verification ---
+    # A critical check to ensure the encoder actually produced an MVC stream.
+    if not _contains_mvc_nal_units(final_combined_path):
+        print("Aborting due to MVC NAL unit verification failure.", file=sys.stderr)
+        sys.exit(1)
+
     # The most reliable verification for the combined stream is tsMuxeR itself.
     # We will simply verify the base view properties within the combined stream.
     if not _verify_stream_with_ffprobe(final_combined_path, "combined 3D stream (base view properties)"):

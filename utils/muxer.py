@@ -2,6 +2,8 @@ import subprocess
 import os
 import shutil
 import sys
+from datetime import datetime
+import shlex
 import re
 import time
 
@@ -39,9 +41,10 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
     clean_source_path = f"{work_dir}/clean_remux_for_audio.mkv"
     final_meta_path = f"{work_dir}/muxer_final.meta"
     tsmuxer_log_path = f"{work_dir}/tsmuxer_output.log"
+    ffmpeg_log_path = f"{work_dir}/ffmpeg_muxer.log"
 
     # This list will hold paths to all temporary files and folders for final cleanup
-    files_to_cleanup = [final_meta_path, tsmuxer_log_path, clean_source_path, video_3d_path]
+    files_to_cleanup = [final_meta_path, tsmuxer_log_path, ffmpeg_log_path, clean_source_path, video_3d_path]
 
     if not os.path.exists(video_3d_path):
         print(f"ERROR: Combined 3D video stream (video_3d.264) not found in {work_dir}", file=sys.stderr)
@@ -58,17 +61,24 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
             print("  [i] No audio or subtitle tracks selected. Skipping remux and extract steps.")
             clean_source_path = None # Signal that there's no clean source
         else:
-            remux_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', source_file]
+            remux_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'info', '-i', source_file]
             for stream in all_selected_streams:
                 remux_cmd.extend(['-map', f'0:{stream["index"]}'])
             remux_cmd.extend(['-c', 'copy', clean_source_path])
             
             print("  [i] Remuxing selected tracks with ffmpeg to fix any timing issues...")
             try:
-                subprocess.run(remux_cmd, check=True)
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                command_str = shlex.join(remux_cmd)
+                with open(ffmpeg_log_path, 'w', encoding='utf-8') as log:
+                    log.write(f"--- FFMPEG Muxer Log ({timestamp}) ---\n")
+                    log.write(f"\n--- Step 2a: FFMPEG Remux ({timestamp}) ---\n")
+                    log.write(f"COMMAND: {command_str}\n\n")
+                    subprocess.run(remux_cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
                 print("  [✓] Clean source created successfully.")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 print(f"ERROR: Failed to create the clean remuxed source file: {e}", file=sys.stderr)
+                print(f"      Check the log for details: {ffmpeg_log_path}", file=sys.stderr)
                 sys.exit(1)
 
         # --- Step 2b: Extract clean elementary streams from the remuxed file ---
@@ -84,8 +94,13 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
                 ts_codec = TSMUXER_CODEC_MAP.get(stream['codec'])
                 if not ts_codec: continue
                 temp_audio_path = f'{work_dir}/clean_audio_{i}.{stream["codec"]}'
-                ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', clean_source_path, '-map', f'0:a:{i}', '-c', 'copy', temp_audio_path]
-                subprocess.run(ffmpeg_cmd, check=True)
+                ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'info', '-i', clean_source_path, '-map', f'0:a:{i}', '-c', 'copy', temp_audio_path]
+                with open(ffmpeg_log_path, 'a', encoding='utf-8') as log:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    command_str = shlex.join(ffmpeg_cmd)
+                    log.write(f"\n--- Extracting Audio Track {i} ({timestamp}) ---\n")
+                    log.write(f"COMMAND: {command_str}\n\n")
+                    subprocess.run(ffmpeg_cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
                 meta_input_files.append(temp_audio_path)
                 extracted_streams_to_cleanup.append(temp_audio_path)
                 audio_track_lines_for_meta.append(f'{ts_codec}, "{temp_audio_path}", lang={stream["lang"]}')
@@ -98,8 +113,13 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
                 file_extension = 'srt' if stream_codec == 'subrip' else 'sup'
                 temp_sub_path = f'{work_dir}/clean_sub_{i}.{file_extension}'
                 subtitle_index_in_remux = len(audio_streams) + i
-                ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', clean_source_path, '-map', f'0:{subtitle_index_in_remux}', '-c', 'copy', temp_sub_path]
-                subprocess.run(ffmpeg_cmd, check=True)
+                ffmpeg_cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'info', '-i', clean_source_path, '-map', f'0:{subtitle_index_in_remux}', '-c', 'copy', temp_sub_path]
+                with open(ffmpeg_log_path, 'a', encoding='utf-8') as log:
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    command_str = shlex.join(ffmpeg_cmd)
+                    log.write(f"\n--- Extracting Subtitle Track {i} ({timestamp}) ---\n")
+                    log.write(f"COMMAND: {command_str}\n\n")
+                    subprocess.run(ffmpeg_cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
                 meta_input_files.append(temp_sub_path)
                 extracted_streams_to_cleanup.append(temp_sub_path)
                 track_line = f'{ts_codec}, "{temp_sub_path}", lang={stream["lang"]}'
@@ -126,8 +146,12 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         output_mode = '--blu-ray-iso' if is_iso_output else '--blu-ray'
 
         final_mux_options = [
-            output_mode, '--blu-ray-3d', '--vbr', '--insertSEI', '--contSPS',
-            f'--label={disk_label}', f'--fps={fps_for_muxer}'
+            # Re-enable SEI/SPS insertion in tsMuxeR. While FRIM now also generates
+            # this info, allowing tsMuxeR to process it can fix potential timing
+            # inconsistencies from the encoded stream.
+            output_mode, '--blu-ray-3d', '--vbr', '--insertSEI', '--contSPS', f'--label={disk_label}',
+            # Use the precise fractional frame rate string for tsMuxeR to avoid rounding errors.
+            f'--fps={properties.get("fps_string", "24000/1001")}'
         ]
         chapters = properties.get('chapters', [])
         if chapters:
@@ -192,6 +216,10 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         # Normalize paths for better cross-platform compatibility and to avoid mixed slashes.
         tsmuxer_cmd_final = ['tsmuxer', os.path.normpath(final_meta_path), os.path.normpath(output_path)]
         with open(tsmuxer_log_path, "w", encoding='utf-8') as log:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            command_str = shlex.join(tsmuxer_cmd_final)
+            log.write(f"--- tsMuxeR Log ({timestamp}) ---\n")
+            log.write(f"COMMAND: {command_str}\n\n")
             subprocess.run(tsmuxer_cmd_final, stdout=log, stderr=subprocess.STDOUT, check=True)
 
         # --- Print tsMuxeR log for immediate feedback ---
@@ -226,6 +254,30 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
             if not os.path.exists(clpi_path) or os.path.getsize(clpi_path) < 100:
                 raise IOError("tsMuxeR failed to generate a valid .clpi file. Check tsmuxer_output.log for details.")
             print("  [✓] Basic validation passed: Key BDMV files were created by tsMuxeR.")
+
+            # --- Deeper ffprobe validation on the output M2TS ---
+            print("\n  [i] Running ffprobe on output M2TS to verify stream codecs...")
+            output_m2ts_path = os.path.join(output_path, "BDMV", "STREAM", "00000.m2ts")
+            try:
+                ffprobe_cmd = [
+                    'ffprobe', '-v', 'error', '-select_streams', 'v',
+                    '-show_entries', 'stream=codec_name',
+                    '-of', 'csv=p=0', output_m2ts_path
+                ]
+                ffprobe_res = subprocess.run(
+                    ffprobe_cmd,
+                    capture_output=True, text=True, check=True, encoding='utf-8'
+                )
+                # The output will be one 'h264' per line for each video stream.
+                video_stream_count = ffprobe_res.stdout.strip().count('h264')
+                print("\n--- FFprobe Post-Mux Stream Info ---")
+                if video_stream_count >= 1:
+                    print(f"  [✓] Found {video_stream_count} H.264 video stream(s) in the final M2TS file.")
+                else:
+                    print(f"  [✗] WARNING: No H.264 video streams found in the final M2TS file.")
+                print("--------------------------------------")
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                print(f"  [!] Warning: Could not run ffprobe on the output file: {e}", file=sys.stderr)
         
         output_type = "ISO file" if output_path.lower().endswith('.iso') else "BDMV folder structure"
         print(f"\n--- Blu-ray 3D {output_type} created successfully! ---")
@@ -237,6 +289,8 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         print(f"An error occurred: {e}", file=sys.stderr)
         if os.path.exists(tsmuxer_log_path):
             print(f"Please check the log file for details: {tsmuxer_log_path}", file=sys.stderr)
+        if os.path.exists(ffmpeg_log_path):
+            print(f"Please check the ffmpeg log file for details: {ffmpeg_log_path}", file=sys.stderr)
         sys.exit(1)
     finally:
         # --- Final Cleanup ---

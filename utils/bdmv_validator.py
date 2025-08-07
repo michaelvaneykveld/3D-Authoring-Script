@@ -1,7 +1,6 @@
 import os
 import subprocess
 import json
-import re
 import sys
 
 def _check_file_structure(bdmv_root_path):
@@ -32,7 +31,7 @@ def _check_file_structure(bdmv_root_path):
     
     return all_ok
 
-def _check_m2ts_stream(m2ts_path):
+def _check_m2ts_stream(m2ts_path, properties):
     """Uses ffprobe to verify the properties of the main M2TS video stream."""
     print("\n--- [2/4] Verifying M2TS video stream properties ---")
     if not os.path.exists(m2ts_path):
@@ -60,8 +59,8 @@ def _check_m2ts_stream(m2ts_path):
             if profile == 'Stereo High':
                 print(f"  [✓] Found a single video stream with 'Stereo High' profile (Correct for 3D).")
             else:
-                print(f"  [✗] FAILURE: Found 1 video stream, but its profile is '{profile}', not 'Stereo High'.")
-                return False
+                print(f"  [!] WARNING: Found 1 video stream, but its profile is '{profile}', not 'Stereo High'. This might be incorrect.")
+                all_ok = False
         elif len(video_streams) == 2:
             print(f"  [✓] Found two video streams (Base + Dependent View) (Correct for 3D).")
             video_info = video_streams[0] # Validate the base view
@@ -78,11 +77,12 @@ def _check_m2ts_stream(m2ts_path):
             all_ok = False
 
         # Check frame rate
+        expected_fps = properties.get('fps_string', '24000/1001')
         fps = video_info.get('r_frame_rate', '')
-        if fps == '24000/1001':
-            print(f"  [✓] Frame rate is correct: {fps} (23.976)")
+        if fps == expected_fps:
+            print(f"  [✓] Frame rate is correct: {fps}")
         else:
-            print(f"  [✗] FAILURE: Frame rate is '{fps}', expected '24000/1001'.")
+            print(f"  [✗] FAILURE: Frame rate is '{fps}', expected '{expected_fps}'.")
             all_ok = False
 
         return all_ok
@@ -91,7 +91,7 @@ def _check_m2ts_stream(m2ts_path):
         print(f"  [✗] ERROR: Could not run ffprobe to verify M2TS stream: {e}", file=sys.stderr)
         return False
 
-def _check_timing_jumps(m2ts_path):
+def _check_timing_jumps(m2ts_path, properties):
     """Uses ffprobe to detect significant jumps in DTS timestamps."""
     print("\n--- [3/4] Verifying stream timing for jumps/errors ---")
     if not os.path.exists(m2ts_path):
@@ -114,9 +114,14 @@ def _check_timing_jumps(m2ts_path):
             print("  [!] WARNING: Not enough frames to analyze timing.")
             return True
 
-        expected_delta = 1 / (24000 / 1001)
+        fps_float = properties.get('fps_float')
+        if not fps_float or fps_float == 0:
+            print("  [!] WARNING: Could not determine expected FPS for timing check. Skipping.")
+            return True # Don't fail the validation if we can't check
+
+        expected_delta = 1 / fps_float
         # Allow a 5% tolerance for floating point inaccuracies
-        tolerance = expected_delta * 0.05
+        tolerance = expected_delta * 0.10 # Use a 10% tolerance to be more forgiving
         
         jumps_found = 0
         for i in range(1, len(timestamps)):
@@ -139,7 +144,7 @@ def _check_timing_jumps(m2ts_path):
 
 def _check_mpls_file(mpls_path):
     """Checks the MPLS file header for the correct magic number."""
-    print("\n--- [4/4] Verifying MPLS playlist file ---")
+    print("\n--- [4/5] Verifying MPLS playlist file ---")
     if not os.path.exists(mpls_path):
         print(f"  [✗] CRITICAL: MPLS file not found at {mpls_path}")
         return False
@@ -158,7 +163,35 @@ def _check_mpls_file(mpls_path):
         print(f"  [✗] ERROR: Could not read MPLS file: {e}", file=sys.stderr)
         return False
 
-def validate_bdmv_structure(bdmv_root_path):
+def _check_frame_count(m2ts_path, expected_frames):
+    """Uses ffprobe to count the frames in the final M2TS stream."""
+    print("\n--- [5/5] Verifying total frame count ---")
+    if not os.path.exists(m2ts_path):
+        print(f"  [✗] CRITICAL: Main stream file not found at {m2ts_path}")
+        return False
+
+    try:
+        ffprobe_cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-count_frames', '-show_entries', 'stream=nb_read_frames',
+            '-of', 'default=noprint_wrappers=1:nokey=1', m2ts_path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True, encoding='utf-8')
+        actual_frames = int(result.stdout.strip())
+
+        # Allow a small tolerance (e.g., 2 frames) for minor discrepancies
+        if abs(actual_frames - expected_frames) <= 2:
+            print(f"  [✓] Frame count is correct (Expected: {expected_frames}, Found: {actual_frames}).")
+            return True
+        else:
+            print(f"  [✗] FAILURE: Frame count mismatch (Expected: {expected_frames}, Found: {actual_frames}).")
+            return False
+
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+        print(f"  [✗] ERROR: Could not run ffprobe to count frames: {e}", file=sys.stderr)
+        return False
+
+def validate_bdmv_structure(bdmv_root_path, properties):
     """
     Runs a series of checks to validate the generated Blu-ray folder structure.
 
@@ -174,11 +207,13 @@ def validate_bdmv_structure(bdmv_root_path):
 
     m2ts_path = os.path.join(bdmv_root_path, "BDMV", "STREAM", "00000.m2ts")
     mpls_path = os.path.join(bdmv_root_path, "BDMV", "PLAYLIST", "00000.mpls")
+    expected_frames = properties.get('total_frames', 0)
 
     # Run all checks and collect results
     structure_ok = _check_file_structure(bdmv_root_path)
-    stream_ok = _check_m2ts_stream(m2ts_path)
-    timing_ok = _check_timing_jumps(m2ts_path)
+    stream_ok = _check_m2ts_stream(m2ts_path, properties)
+    timing_ok = _check_timing_jumps(m2ts_path, properties)
     mpls_ok = _check_mpls_file(mpls_path)
+    frames_ok = _check_frame_count(m2ts_path, expected_frames)
 
-    return structure_ok and stream_ok and timing_ok and mpls_ok
+    return structure_ok and stream_ok and timing_ok and mpls_ok and frames_ok

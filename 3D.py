@@ -142,7 +142,7 @@ def main():
         # Validation is only performed for BDMV folders, not ISOs.
         if not output_path.lower().endswith('.iso'):
             print("\n--- Starting Post-Mux Validation ---")
-            validation_passed = validate_bdmv_structure(output_path)
+            validation_passed = validate_bdmv_structure(output_path, video_properties)
             if validation_passed:
                 print("\n--- Validation Successful ---")
                 print(f"The Blu-ray 3D folder structure at:\n{output_path}\nappears to be valid and compliant.")
