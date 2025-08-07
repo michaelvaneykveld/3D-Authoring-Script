@@ -72,3 +72,26 @@ def ask_yes_no(title, message):
         return messagebox.askyesno(parent=root, title=title, message=message)
     finally:
         root.destroy()
+
+def ask_output_type():
+    """
+    Displays a custom messagebox asking the user to choose between ISO and BDMV.
+
+    Returns:
+        str: 'yes' for ISO, 'no' for BDMV. Returns 'cancel' if the dialog is closed.
+    """
+    root = _create_hidden_root()
+    try:
+        # askyesnocancel returns True, False, or None.
+        # We map this to strings for clarity in the main script.
+        result = messagebox.askyesnocancel(
+            parent=root,
+            title="Select Output Type",
+            message="How would you like to save the final Blu-ray?\n\n"
+                    "Press 'Yes' to create a single .ISO file.\n"
+                    "Press 'No' to create a BDMV folder structure.",
+            icon=messagebox.QUESTION
+        )
+        return 'yes' if result is True else 'no' if result is False else 'cancel'
+    finally:
+        root.destroy()

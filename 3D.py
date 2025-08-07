@@ -3,7 +3,7 @@ import sys
 import os
 import shutil
 import re
-from utils.file_selector import select_source_file, select_output_directory, select_output_iso, ask_yes_no
+from utils.file_selector import select_source_file, select_output_directory, select_output_iso, ask_yes_no, ask_output_type
 from utils.video_analyzer import analyze_video
 from utils.track_selector import select_tracks
 from utils.encoder import create_3d_video_streams
@@ -40,12 +40,10 @@ def run_dependency_check():
 def should_skip_encoding(work_dir: str) -> bool:
     """Checks for existing, valid encoded files to determine if encoding can be skipped."""
     left_eye_path = os.path.join(work_dir, 'left_eye.264')
-    dep_chunks_exist = False
-    if os.path.isdir(work_dir):
-        dep_chunks_exist = any(f.startswith('temp_chunk_') and f.endswith('_dep.264') for f in os.listdir(work_dir))
+    right_eye_path = os.path.join(work_dir, 'right_eye.264')
 
     files_exist_and_are_valid = (
-        os.path.exists(left_eye_path) and os.path.getsize(left_eye_path) > 0 and dep_chunks_exist
+        os.path.exists(left_eye_path) and os.path.getsize(left_eye_path) > 0 and os.path.exists(right_eye_path) and os.path.getsize(right_eye_path) > 0
     )
 
     if files_exist_and_are_valid:
@@ -59,7 +57,7 @@ def should_skip_encoding(work_dir: str) -> bool:
             return True
         else:
             print("--- Proceeding with re-encoding as requested. ---")
-    elif os.path.exists(left_eye_path) or dep_chunks_exist:
+    elif os.path.exists(left_eye_path) or os.path.exists(right_eye_path):
         # This case handles when the file exists but is empty (e.g., from a previously failed run)
         print("\n[!] Found existing but potentially corrupt (empty) encoded files. Forcing re-encoding.")
     
@@ -124,38 +122,36 @@ def main():
             create_3d_video_streams(source_file, video_properties, work_dir)
 
         # --- Step 2: Muxing ---
-        print("\nA dialog will now open to select the PARENT directory for the final output (e.g., 'Downloads' or 'Movies')...")
-        parent_output_dir = select_output_directory(title="Select Parent Directory for Final Blu-ray")
-        if not parent_output_dir:
-            print("No parent directory selected. Aborting.")
+        output_type_choice = ask_output_type() # Returns 'yes' for ISO, 'no' for BDMV
+
+        if output_type_choice == 'yes':
+            print("\nA dialog will now open to select the save location for the final Blu-ray ISO file...")
+            output_path = select_output_iso()
+        else:
+            print("\nA dialog will now open to select the location for the final BDMV folder...")
+            output_path = select_output_directory(title="Select Final BDMV Output Folder")
+
+        if not output_path:
+            print("No output location selected. Aborting.")
             # We still want to offer cleanup, so we don't exit here.
             # The finally block will execute.
             return
+        
+        print(f"Final output will be created at: {output_path}")
 
-        # Get a name for the project to create a dedicated subfolder, preventing permission errors.
-        base_name = os.path.splitext(os.path.basename(source_file))[0]
-        # Sanitize the base_name to be a valid folder name.
-        # Replace spaces with underscores and remove other invalid characters.
-        sanitized_base_name = re.sub(r'[\\/*?:"<>| ]', "_", base_name)
-        project_name = input(f"Enter a name for the Blu-ray output folder (press Enter to use '{sanitized_base_name}'): ").strip()
-        if not project_name:
-            project_name = sanitized_base_name
-
-        output_bdmv_path = os.path.join(parent_output_dir, project_name)
-        print(f"Final Blu-ray folder will be created at: {output_bdmv_path}")
-
-        create_bluray_structure(video_properties, source_file, work_dir, output_bdmv_path)
+        create_bluray_structure(video_properties, source_file, work_dir, output_path)
 
         # --- Step 3: Post-Mux Validation ---
-        print("\n--- Starting Post-Mux Validation ---")
-        validation_passed = validate_bdmv_structure(output_bdmv_path)
-
-        if validation_passed:
-            print("\n--- Validation Successful ---")
-            print(f"The Blu-ray 3D folder structure at:\n{output_bdmv_path}\nappears to be valid and compliant.")
-        else:
-            print("\n--- Validation Failed ---")
-            print("The generated Blu-ray structure has issues. Please review the validation log above.")
+        # Validation is only performed for BDMV folders, not ISOs.
+        if not output_path.lower().endswith('.iso'):
+            print("\n--- Starting Post-Mux Validation ---")
+            validation_passed = validate_bdmv_structure(output_path)
+            if validation_passed:
+                print("\n--- Validation Successful ---")
+                print(f"The Blu-ray 3D folder structure at:\n{output_path}\nappears to be valid and compliant.")
+            else:
+                print("\n--- Validation Failed ---")
+                print("The generated Blu-ray structure has issues. Please review the validation log above.")
 
     except Exception as e:
         print(f"\n--- An unexpected error occurred: {e} ---", file=sys.stderr)
@@ -164,6 +160,7 @@ def main():
     finally:
         # This block will run whether the try block succeeded or failed.
         # --- Final Cleanup Step ---
+        print("\n--- Process Complete ---")
         if work_dir and os.path.exists(work_dir):
             cleanup = ask_yes_no(
                 title="Cleanup Temporary Files?",

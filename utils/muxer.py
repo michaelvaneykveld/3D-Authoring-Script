@@ -36,23 +36,19 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
 
     # --- Define all paths ---
     left_eye_path = f"{work_dir}/left_eye.264"
-    # Find all the dependent view chunk files, sorted numerically
-    dep_chunk_files = sorted(
-        [f"{work_dir}/{f}" for f in os.listdir(work_dir) if f.startswith('temp_chunk_') and f.endswith('_dep.264')],
-        key=lambda x: int(re.search(r'temp_chunk_(\d+)_dep\.264', x).group(1))
-    )
+    right_eye_path = f"{work_dir}/right_eye.264"
     clean_source_path = f"{work_dir}/clean_remux_for_audio.mkv"
     final_meta_path = f"{work_dir}/muxer_final.meta"
     tsmuxer_log_path = f"{work_dir}/tsmuxer_output.log"
 
     # This list will hold paths to all temporary files and folders for final cleanup
-    files_to_cleanup = [final_meta_path, tsmuxer_log_path, clean_source_path, left_eye_path] + dep_chunk_files
+    files_to_cleanup = [final_meta_path, tsmuxer_log_path, clean_source_path, left_eye_path, right_eye_path]
 
     if not os.path.exists(left_eye_path):
         print(f"ERROR: Base view stream (left_eye.264) not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
-    if not dep_chunk_files:
-        print(f"ERROR: Dependent view chunks (*_dep.264) not found in {work_dir}", file=sys.stderr)
+    if not os.path.exists(right_eye_path):
+        print(f"ERROR: Dependent view stream (right_eye.264) not found in {work_dir}", file=sys.stderr)
         print("This likely indicates a failure during the encoding step.", file=sys.stderr)
         sys.exit(1)
 
@@ -122,28 +118,29 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
 
         # --- Step 2d: Final Mux - Combine all elementary streams ---
         print("\n--- Step 2d: Muxing all streams into the final Blu-ray structure ---")
+        is_iso_output = output_path.lower().endswith('.iso')
         base_name = os.path.splitext(os.path.basename(output_path))[0]
         disk_label = ''.join(c for c in base_name if c.isalnum() or c in ' _-').strip() or "BLURAY_3D_DISC"
 
         # Use decimal representation to ensure consistency with the encoder.
         fps_for_muxer = f"{properties.get('fps_float', 23.976):.3f}"
 
-        # Build MUXOPT line according to new requirements for full compatibility.
+        # Build MUXOPT line. Critically, we must explicitly tell tsMuxeR whether
+        # to create a BDMV folder (--blu-ray) or an ISO file (--blu-ray-iso).
+        output_mode = '--blu-ray-iso' if is_iso_output else '--blu-ray'
+
         final_mux_options = [
-            '--blu-ray-3d', '--vbr', '--insertSEI', '--contSPS',
+            output_mode, '--blu-ray-3d', '--vbr', '--insertSEI', '--contSPS',
             f'--label={disk_label}', f'--fps={fps_for_muxer}'
         ]
         chapters = properties.get('chapters', [])
         if chapters:
             final_mux_options.append(f'--custom-chapters={";".join(chapters)}')
 
-        # Format the dependent view files for the meta file string, e.g., "file1"+"file2"
-        right_eye_files_str = '+'.join([f'"{f}"' for f in dep_chunk_files])
-
         final_meta_content = [
             f'MUXOPT {" ".join(final_mux_options)}',
             f'V_MPEG4/ISO/AVC, "{left_eye_path}", ssif',
-            f'V_MPEG4/ISO/MVC, {right_eye_files_str}, track=4113',
+            f'V_MPEG4/ISO/MVC, "{right_eye_path}", track=4113',
         ]
         
         final_meta_content.extend(audio_track_lines_for_meta)
@@ -152,7 +149,7 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         # --- Pre-flight check for all input files before calling tsMuxeR ---
         print("\n  [i] Verifying all source files for the muxer exist and are valid...")
         all_files_ok = True
-        files_to_check_in_meta = [left_eye_path] + dep_chunk_files + meta_input_files
+        files_to_check_in_meta = [left_eye_path, right_eye_path] + meta_input_files
         for f_path in files_to_check_in_meta:
             if not os.path.exists(f_path):
                 print(f"  [✗] FATAL: Input file for meta does not exist: {os.path.basename(f_path)}", file=sys.stderr)
@@ -163,7 +160,6 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         if not all_files_ok:
             raise IOError("Aborting mux due to missing or empty input files. This indicates a failure in a previous step (encoding or track extraction).")
         print("  [✓] All source files are present and valid.")
-
         print("\n--- Generated .meta file content ---")
         print('\n'.join(final_meta_content))
         print("-" * 34)
@@ -174,18 +170,27 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         
         # --- Proactively create the entire BDMV directory structure ---
         # This prevents partial creation issues and also acts as a write permission check.
-        print("  [i] Proactively creating required BDMV directory structure...")
-        required_subdirs = [
-            os.path.join(output_path, "BDMV", "STREAM"),
-            os.path.join(output_path, "BDMV", "PLAYLIST"),
-            os.path.join(output_path, "BDMV", "CLIPINF"),
-            os.path.join(output_path, "BDMV", "BACKUP", "PLAYLIST"),
-            os.path.join(output_path, "BDMV", "BACKUP", "CLIPINF"),
-            os.path.join(output_path, "CERTIFICATE")
-        ]
-        for subdir in required_subdirs:
-            os.makedirs(subdir, exist_ok=True)
-        print(f"  [✓] Ensured output directory structure exists at: {os.path.normpath(output_path)}")
+        
+        if is_iso_output:
+            # For ISO files, we only need to ensure the parent directory exists.
+            parent_dir = os.path.dirname(output_path)
+            if parent_dir: # Check if it's not a root path like 'C:\'
+                os.makedirs(parent_dir, exist_ok=True)
+            print(f"  [✓] Ensured output directory exists for ISO file: {os.path.normpath(parent_dir)}")
+        else:
+            # For BDMV, create the full structure.
+            print("  [i] Proactively creating required BDMV directory structure...")
+            required_subdirs = [
+                os.path.join(output_path, "BDMV", "STREAM"),
+                os.path.join(output_path, "BDMV", "PLAYLIST"),
+                os.path.join(output_path, "BDMV", "CLIPINF"),
+                os.path.join(output_path, "BDMV", "BACKUP", "PLAYLIST"),
+                os.path.join(output_path, "BDMV", "BACKUP", "CLIPINF"),
+                os.path.join(output_path, "CERTIFICATE")
+            ]
+            for subdir in required_subdirs:
+                os.makedirs(subdir, exist_ok=True)
+            print(f"  [✓] Ensured output directory structure exists at: {os.path.normpath(output_path)}")
 
         print(f"  [i] Running tsMuxeR. Output will be logged to: {os.path.basename(tsmuxer_log_path)}")
         # Normalize paths for better cross-platform compatibility and to avoid mixed slashes.
@@ -195,62 +200,35 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
 
         # --- Post-Mux Validation ---
         print("  [i] Verifying that tsMuxeR created essential output files...")
-        mpls_path = os.path.join(output_path, "BDMV", "PLAYLIST", "00000.mpls")
-        clpi_path = os.path.join(output_path, "BDMV", "CLIPINF", "00000.clpi")
+        if not is_iso_output:
+            mpls_path = os.path.join(output_path, "BDMV", "PLAYLIST", "00000.mpls")
+            clpi_path = os.path.join(output_path, "BDMV", "CLIPINF", "00000.clpi")
 
-        if not os.path.exists(mpls_path) or os.path.getsize(mpls_path) < 100:
-            raise IOError("tsMuxeR failed to generate a valid .mpls file. Check tsmuxer_output.log for details.")
-        if not os.path.exists(clpi_path) or os.path.getsize(clpi_path) < 100:
-            raise IOError("tsMuxeR failed to generate a valid .clpi file. Check tsmuxer_output.log for details.")
-        print("  [✓] Basic validation passed: Key BDMV files were created by tsMuxeR.")
+            if not os.path.exists(mpls_path) or os.path.getsize(mpls_path) < 100:
+                raise IOError("tsMuxeR failed to generate a valid .mpls file. Check tsmuxer_output.log for details.")
+            if not os.path.exists(clpi_path) or os.path.getsize(clpi_path) < 100:
+                raise IOError("tsMuxeR failed to generate a valid .clpi file. Check tsmuxer_output.log for details.")
+            print("  [✓] Basic validation passed: Key BDMV files were created by tsMuxeR.")
         
         output_type = "ISO file" if output_path.lower().endswith('.iso') else "BDMV folder structure"
         print(f"\n--- Blu-ray 3D {output_type} created successfully! ---")
-        print(f"Location: {output_path}")
+        print(f"Output location: {os.path.normpath(output_path)}")
         success = True
 
-    except (IOError, subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-        print("\nFATAL ERROR: Muxing process failed.", file=sys.stderr)
-        print(f"Error details: {e}", file=sys.stderr)
-
-        # --- Enhanced Error Analysis ---
-        # Check the log for the specific "Can't create file" error, which often
-        # indicates a permissions issue with Windows Controlled Folder Access.
+    except (subprocess.CalledProcessError, FileNotFoundError, IOError) as e:
+        print(f"\n--- MUXING FAILED ---", file=sys.stderr)
+        print(f"An error occurred: {e}", file=sys.stderr)
         if os.path.exists(tsmuxer_log_path):
-            with open(tsmuxer_log_path, 'r', encoding='utf-8') as log_file:
-                log_content = log_file.read()
-                if "Can't create file" in log_content:
-                    print("\n--- [!] Potential Permission Issue Detected ---", file=sys.stderr)
-                    print("The error 'Can't create file' strongly suggests that tsMuxeR is being blocked", file=sys.stderr)
-                    print("by a security feature, most likely Windows 'Controlled Folder Access'.", file=sys.stderr)
-                    print("\nRecommended Solutions:", file=sys.stderr)
-                    print("  1. (Best) Rerun the script and choose a different PARENT directory for the final output,", file=sys.stderr)
-                    print("     such as the root of a drive (e.g., 'C:\\' or 'D:\\') or a non-system folder.", file=sys.stderr)
-                    print("  2. (Advanced) Add 'tsMuxeR.exe' to the list of allowed apps in your Windows", file=sys.stderr)
-                    print("     Security settings under 'Virus & threat protection' > 'Ransomware protection'.", file=sys.stderr)
-
-        print(f"\n[!] The detailed tsMuxeR log has been preserved for debugging at:\n    {os.path.normpath(tsmuxer_log_path)}", file=sys.stderr)
+            print(f"Please check the log file for details: {tsmuxer_log_path}", file=sys.stderr)
         sys.exit(1)
     finally:
-        # --- Cleanup of internal temporary files ---
-        print("\n  [i] Cleaning up internal muxer temporary files...")
-
-        # If the process failed, do not delete the tsMuxeR log file.
-        if not success and tsmuxer_log_path in files_to_cleanup:
-            files_to_cleanup.remove(tsmuxer_log_path)
-
-        for f_path in files_to_cleanup:
-            if not f_path or not os.path.exists(f_path): continue
-            
-            # Retry mechanism for deletion to handle potential file locks from external processes.
-            for attempt in range(3):
-                try:
-                    os.remove(f_path)
-                    print(f"    [✓] Removed temporary file: {os.path.basename(f_path)}")
-                    break # Success, exit the retry loop
-                except OSError as e:
-                    if attempt < 2: # If not the last attempt
-                        print(f"    [!] Could not delete {os.path.basename(f_path)}, retrying in 1 second... (Error: {e})")
-                        time.sleep(1)
-                    else:
-                        print(f"    [✗] WARNING: Could not delete temp file {os.path.basename(f_path)} after multiple attempts: {e}. May require manual deletion.", file=sys.stderr)
+        # --- Final Cleanup ---
+        if success:
+            print("\n--- Cleaning up temporary muxing files ---")
+            for f in files_to_cleanup:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError as e:
+                        print(f"  [!] Warning: Could not remove temporary file {os.path.basename(f)}: {e}", file=sys.stderr)
+            print("  [✓] Cleanup complete.")

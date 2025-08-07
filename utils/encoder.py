@@ -4,12 +4,28 @@ import os
 import json
 import shutil
 
-def _verify_stream_with_ffprobe(stream_path, eye_name):
+def _verify_stream_with_ffprobe(stream_path, eye_name, is_dependent_view=False):
     """
-    Verifies the encoded stream using ffprobe to check for compliance.
+    Verifies the encoded stream.
+    For the base (AVC) view, it uses ffprobe for a full compliance check.
+    For the dependent (MVC) view, it only checks for existence and size,
+    as ffprobe cannot correctly parse raw MVC streams.
     Returns True on success, False on failure.
     """
     print(f"\n--- Verifying {eye_name} stream ---")
+
+    if not os.path.exists(stream_path) or os.path.getsize(stream_path) == 0:
+        print(f"  [✗] ERROR: Stream file '{os.path.basename(stream_path)}' does not exist or is empty.", file=sys.stderr)
+        return False
+
+    # For the dependent MVC stream, a simple existence and size check is sufficient and correct.
+    # ffprobe cannot correctly parse raw MVC streams, so a full check would always fail.
+    if is_dependent_view:
+        print(f"  [✓] Verification successful for: {os.path.basename(stream_path)}")
+        print("    - Note:           Full compliance check is skipped as ffprobe cannot parse raw MVC streams.")
+        print("    - Verification:   File exists and is not empty.")
+        return True
+
     try:
         # Use subprocess.run which is designed for this "run and wait" pattern
         # and accepts the capture_output, text, and check arguments.
@@ -72,6 +88,20 @@ def _verify_stream_with_ffprobe(stream_path, eye_name):
         print(f"      ffprobe output:\n{e.stderr or e.stdout}", file=sys.stderr)
         return False
 
+def _concatenate_chunks(chunk_files, final_output_path):
+    """Helper to concatenate .264 chunk files using a simple binary copy, which is more robust than ffmpeg's concat demuxer for raw streams."""
+    try:
+        with open(final_output_path, 'wb') as outfile:
+            for chunk_file in chunk_files:
+                with open(chunk_file, 'rb') as infile:
+                    shutil.copyfileobj(infile, outfile)
+        print(f"  [✓] All chunks concatenated successfully into {os.path.basename(final_output_path)}.")
+    finally:
+        # Clean up the individual chunks
+        for f in chunk_files:
+            if os.path.exists(f):
+                os.remove(f)
+
 def create_3d_video_streams(source_file, properties, output_dir):
     """
     Creates Blu-ray 3D compliant streams by processing the video in chunks
@@ -82,14 +112,6 @@ def create_3d_video_streams(source_file, properties, output_dir):
 
     # --- Configuration ---
     CHUNK_SIZE_FRAMES = 300  # Number of frames to process per chunk.
-
-    # --- Define paths ---
-    final_base_path = os.path.join(output_dir, 'left_eye.264')
-    # The dependent view chunks will be handled by the muxer, not concatenated here.
-
-    # Ensure final output file is empty before we start appending
-    if os.path.exists(final_base_path):
-        os.remove(final_base_path)
 
     # --- Get properties ---
     total_frames = properties.get('total_frames')
@@ -106,7 +128,7 @@ def create_3d_video_streams(source_file, properties, output_dir):
     # --- Main processing loop ---
     num_chunks = (total_frames + CHUNK_SIZE_FRAMES - 1) // CHUNK_SIZE_FRAMES
     base_chunk_files = []
-    base_concat_list_path = os.path.join(output_dir, 'base_concat_list.txt')
+    dep_chunk_files = []
 
     for i in range(num_chunks):
         start_frame = i * CHUNK_SIZE_FRAMES
@@ -121,7 +143,7 @@ def create_3d_video_streams(source_file, properties, output_dir):
         base_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_base.264')
         dep_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_dep.264')
         base_chunk_files.append(base_chunk_264)
-        # Dependent chunks are not added to a list for concatenation here.
+        dep_chunk_files.append(dep_chunk_264)
         try:
             # --- Step 1: Extract YUV chunks with ffmpeg ---
             ffmpeg_cmd_left = [
@@ -179,30 +201,21 @@ def create_3d_video_streams(source_file, properties, output_dir):
             for f in [left_chunk_yuv, right_chunk_yuv]:
                 if os.path.exists(f):
                     os.remove(f)
-
-    # --- Step 3 (Post-Loop): Concatenate ONLY the base (left eye) chunks ---
-    print("\n--- Concatenating all left eye chunks into a final stream ---")
-    try:
-        with open(base_concat_list_path, 'w') as f:
-            for chunk_file in base_chunk_files:
-                f.write(f"file '{os.path.basename(chunk_file)}'\n")
-
-        ffmpeg_concat_base_cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-f', 'concat', '-safe', '0', '-i', base_concat_list_path,
-            '-c', 'copy', final_base_path
-        ]
-        subprocess.run(ffmpeg_concat_base_cmd, check=True, cwd=output_dir)
-        print("  [✓] All left eye chunks concatenated successfully.")
-    finally:
-        # Clean up the individual encoded chunks and the list file
-        # The dependent chunks (_dep.264) are left for the muxer.
-        for f in base_chunk_files + [base_concat_list_path]:
-            if os.path.exists(f):
-                os.remove(f)
+    
+    # --- Step 3 (Post-Loop): Concatenate chunks into final streams ---
+    print("\n--- Concatenating all chunks into final streams ---")
+    final_base_path = os.path.join(output_dir, 'left_eye.264')
+    _concatenate_chunks(base_chunk_files, final_base_path)
+    
+    final_dep_path = os.path.join(output_dir, 'right_eye.264')
+    _concatenate_chunks(dep_chunk_files, final_dep_path)
 
     # --- Final Verification ---
     if not _verify_stream_with_ffprobe(final_base_path, "left eye (base view)"):
+        print("Aborting due to stream verification failure.", file=sys.stderr)
+        sys.exit(1)
+    
+    if not _verify_stream_with_ffprobe(final_dep_path, "right eye (dependent view)", is_dependent_view=True):
         print("Aborting due to stream verification failure.", file=sys.stderr)
         sys.exit(1)
 
