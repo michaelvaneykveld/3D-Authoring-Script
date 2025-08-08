@@ -88,12 +88,15 @@ If a BDMV folder was created, a final battery of tests is run to guarantee compl
 
 ## Prerequisites
 
-The following command-line tools must be installed and accessible in your system's PATH:
+The following command-line tools and Python packages must be installed:
 
 - **FFmpeg**: For decoding, cropping, and track extraction. (Download)
 - **tsMuxeR**: For muxing elementary streams into a Blu-ray structure. (Download)
-- **MKVToolNix**: Provides `mkvextract`, used for some track extraction tasks. (Download)
 - **FRIM**: Provides `FRIMEncode` for AVC+MVC encoding. (Download)
+- **bitstring**: A Python package for parsing binary data.
+  ```bash
+  pip install bitstring
+  ```
 
 ## How to Use
 

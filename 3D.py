@@ -1,6 +1,20 @@
-import subprocess
 import sys
 import os
+
+# --- Step 1: Perform dependency checks BEFORE importing anything else ---
+# This is critical to provide a clear error message if packages are missing,
+# instead of an unhandled ModuleNotFoundError.
+try:
+    from utils.check_dependencies import run_all_checks
+    run_all_checks()
+    print("--- Dependency Check Passed ---\n")
+except ImportError as e:
+    # This could happen if the utils folder is not found, a very basic issue.
+    print(f"FATAL: Could not import dependency checker. Ensure the script structure is correct. Error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# --- Step 2: Import the rest of the modules now that checks have passed ---
+import subprocess
 import shutil
 import re
 from utils.file_selector import select_source_file, select_output_directory, select_output_iso, ask_yes_no, ask_output_type
@@ -10,38 +24,13 @@ from utils.encoder import create_3d_video_streams
 from utils.muxer import create_bluray_structure
 from utils.bdmv_validator import validate_bdmv_structure
 
-def run_dependency_check():
-    """
-    Runs the dependency check script.
-    The program will exit if the check fails or the script is not found.
-    """
-    checker_script_path = os.path.join(os.path.dirname(__file__), 'utils', 'check_dependencies.py')
-
-    print("--- Running Dependency Check ---")
-    try:
-        # A simple, direct call is now sufficient. The checker script will print
-        # all necessary information and exit with an error if something is wrong.
-        subprocess.run(
-            [sys.executable, checker_script_path],
-            check=True,
-            text=True,
-            encoding='utf-8'
-        )
-        print("--- Dependency Check Passed ---\n")
-    except FileNotFoundError:
-        print(f"ERROR: Dependency check script not found at '{checker_script_path}'")
-        sys.exit(1)
-    except subprocess.CalledProcessError:
-        # The checker script now prints its own detailed error messages.
-        # We just need to inform the user that the script is aborting.
-        print("\n--- Aborting due to missing dependencies. Please review the messages above. ---")
-        sys.exit(1)
-
 def should_skip_encoding(work_dir: str) -> bool:
     """Checks for existing, valid encoded files to determine if encoding can be skipped."""
-    video_3d_path = os.path.join(work_dir, 'video_3d.264')
+    left_eye_path = os.path.join(work_dir, 'left_eye.264')
+    right_eye_path = os.path.join(work_dir, 'right_eye.264')
 
-    files_exist_and_are_valid = os.path.exists(video_3d_path) and os.path.getsize(video_3d_path) > 0
+    files_exist_and_are_valid = (os.path.exists(left_eye_path) and os.path.getsize(left_eye_path) > 0 and
+                                 os.path.exists(right_eye_path) and os.path.getsize(right_eye_path) > 0)
 
     if files_exist_and_are_valid:
         print("\n[i] Found existing, valid encoded 3D .264 streams in the temporary directory.")
@@ -54,7 +43,7 @@ def should_skip_encoding(work_dir: str) -> bool:
             return True
         else:
             print("--- Proceeding with re-encoding as requested. ---")
-    elif os.path.exists(video_3d_path):
+    elif os.path.exists(left_eye_path) or os.path.exists(right_eye_path):
         # This case handles when the file exists but is empty (e.g., from a previously failed run)
         print("\n[!] Found existing but potentially corrupt (empty) encoded files. Forcing re-encoding.")
     
@@ -62,8 +51,6 @@ def should_skip_encoding(work_dir: str) -> bool:
 
 def main():
     """Main function to run the 3D authoring workflow."""
-    run_dependency_check()
-
     print("--- Source File Selection ---")
     source_file = select_source_file()
     if not source_file:

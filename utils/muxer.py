@@ -37,17 +37,22 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
     work_dir = work_dir.replace('\\', '/')
 
     # --- Define all paths ---
-    video_3d_path = f"{work_dir}/video_3d.264"
+    left_eye_path = f"{work_dir}/left_eye.264"
+    right_eye_path = f"{work_dir}/right_eye.264"
     clean_source_path = f"{work_dir}/clean_remux_for_audio.mkv"
     final_meta_path = f"{work_dir}/muxer_final.meta"
     tsmuxer_log_path = f"{work_dir}/tsmuxer_output.log"
     ffmpeg_log_path = f"{work_dir}/ffmpeg_muxer.log"
 
     # This list will hold paths to all temporary files and folders for final cleanup
-    files_to_cleanup = [final_meta_path, tsmuxer_log_path, ffmpeg_log_path, clean_source_path, video_3d_path]
+    files_to_cleanup = [final_meta_path, tsmuxer_log_path, ffmpeg_log_path, clean_source_path, left_eye_path, right_eye_path]
 
-    if not os.path.exists(video_3d_path):
-        print(f"ERROR: Combined 3D video stream (video_3d.264) not found in {work_dir}", file=sys.stderr)
+    if not os.path.exists(left_eye_path):
+        print(f"ERROR: Base view stream (left_eye.264) not found in {work_dir}", file=sys.stderr)
+        print("This likely indicates a failure during the encoding step.", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(right_eye_path):
+        print(f"ERROR: Dependent view stream (right_eye.264) not found in {work_dir}", file=sys.stderr)
         print("This likely indicates a failure during the encoding step.", file=sys.stderr)
         sys.exit(1)
 
@@ -159,8 +164,8 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
 
         final_meta_content = [
             f'MUXOPT {" ".join(final_mux_options)}',
-            # The 'MVC' keyword tells tsMuxeR to look for the dependent view inside this same file.
-            f'V_MPEG4/ISO/AVC, "{video_3d_path}", MVC, ssif',
+            f'V_MPEG4/ISO/AVC, "{left_eye_path}", ssif',
+            f'V_MPEG4/ISO/MVC, "{right_eye_path}", track=4113',
         ]
         
         final_meta_content.extend(audio_track_lines_for_meta)
@@ -169,7 +174,7 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
         # --- Pre-flight check for all input files before calling tsMuxeR ---
         print("\n  [i] Verifying all source files for the muxer exist and are valid...")
         all_files_ok = True
-        files_to_check_in_meta = [video_3d_path] + meta_input_files
+        files_to_check_in_meta = [left_eye_path, right_eye_path] + meta_input_files
         for f_path in files_to_check_in_meta:
             if not os.path.exists(f_path):
                 print(f"  [✗] FATAL: Input file for meta does not exist: {os.path.basename(f_path)}", file=sys.stderr)
@@ -188,6 +193,24 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
             # Ensure the file ends with a newline for tsMuxeR compatibility.
             f.write('\n'.join(final_meta_content) + '\n')
         
+        # --- Verify the meta file content for the critical MVC line ---
+        print("\n  [i] Verifying .meta file for correct MVC directive...")
+        with open(final_meta_path, 'r', encoding='utf-8') as f:
+            meta_content_read = f.read()
+            # We check for the presence of 'MVC, ssif' which is the key part.
+            # The filename can vary in path format, so we check for the keywords.
+            mvc_line_found = False
+            # Check for the two separate video lines
+            avc_line = any("V_MPEG4/ISO/AVC" in line and "ssif" in line for line in meta_content_read.splitlines())
+            mvc_line = any("V_MPEG4/ISO/MVC" in line and "track=4113" in line for line in meta_content_read.splitlines())
+            mvc_line_found = avc_line and mvc_line
+            
+            if mvc_line_found:
+                print("  [✓] SUCCESS: .meta file contains the correct AVC and MVC directives.")
+            else:
+                print("  [✗] FATAL: The generated .meta file is missing the critical 'MVC, ssif' directive.", file=sys.stderr)
+                raise IOError("Meta file generation failed to include MVC directive.")
+
         # --- Proactively create the entire BDMV directory structure ---
         # This prevents partial creation issues and also acts as a write permission check.
         
@@ -240,7 +263,7 @@ def create_bluray_structure(properties, source_file, work_dir, output_path):
                 print("  [✓] SUCCESS: tsMuxeR correctly detected 2 views (Base + Dependent).")
             else:
                 print("  [✗] FATAL: tsMuxeR did NOT detect 2 views. The output is likely not 3D.", file=sys.stderr)
-                print("      This can be caused by an issue with the encoded video_3d.264 stream.", file=sys.stderr)
+                print("      This can be caused by an issue with the encoded .264 streams.", file=sys.stderr)
                 raise IOError("tsMuxeR failed to create a stereoscopic stream.")
 
         # --- Post-Mux Validation ---

@@ -1,14 +1,15 @@
 import sys
 import shutil
-import subprocess
+import importlib.util
 
-def check_system_dependencies():
+def run_all_checks():
     """
-    Checks if required command-line tools are available in the system's PATH.
+    Checks for all system and Python dependencies.
     Exits with a non-zero status code if any dependency is missing.
     """
+    # --- Check for command-line tools ---
     print("--- Checking System Dependencies ---")
-    required_tools = ['ffmpeg', 'ffprobe', 'tsMuxer', 'mkvextract', 'FRIMEncode64']
+    required_tools = ['ffmpeg', 'ffprobe', 'tsMuxer', 'FRIMEncode64']
     missing_tools = []
 
     for tool in required_tools:
@@ -27,14 +28,27 @@ def check_system_dependencies():
         print("\nPlease install them and ensure their locations are added to the PATH environment variable.")
         print("You may need to restart your terminal/computer for the changes to take effect.")
         print("\nRecommended downloads:")
-        print("  - FFmpeg (includes ffmpeg, ffprobe): https://www.gyan.dev/ffmpeg/builds/")
+        print("  - FFmpeg (provides ffmpeg, ffprobe): https://www.gyan.dev/ffmpeg/builds/")
         print("  - tsMuxeR: https://github.com/justdan96/tsMuxer/releases")
-        print("  - MKVToolNix (includes mkvextract): https://mkvtoolnix.download/downloads.html")
-        print("  - FRIM (includes FRIMEncode64): https://www.videohelp.com/software/FRIM")
+        print("  - FRIM (provides FRIMEncode64): https://www.videohelp.com/software/FRIM")
         sys.exit(1)
-    else:
-        print("-" * 50)
-        print("✅ All essential dependencies were found and are ready to use.")
+    
+    # --- Check for required Python packages ---
+    print("\n--- Checking Python Package Dependencies ---")
+    required_packages = ['bitstring']
+    missing_packages = []
 
-if __name__ == "__main__":
-    check_system_dependencies()
+    for package in required_packages:
+        spec = importlib.util.find_spec(package)
+        if spec is None:
+            print(f"  [✗] Package '{package}' not found.")
+            missing_packages.append(package)
+        else:
+            print(f"  [✓] Found package: '{package}'")
+
+    if missing_packages:
+        print("\n--- ERROR: Missing Python Packages ---")
+        print("Please install the missing packages using pip:")
+        for package in missing_packages:
+            print(f"    pip install {package}")
+        sys.exit(1)

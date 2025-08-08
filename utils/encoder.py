@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 import shlex
 import hashlib
+from bitstring import ConstBitStream
 import shutil
 
 def _verify_stream_with_ffprobe(stream_path, eye_name, is_dependent_view=False):
@@ -105,6 +106,43 @@ def _concatenate_chunks(chunk_files, final_output_path):
             if os.path.exists(f):
                 os.remove(f)
 
+def _verify_sps_pps_presence(path):
+    """
+    Uses ffprobe to verify that the stream contains both SPS and PPS NAL units,
+    which are essential for decodability.
+    """
+    print("\n--- Verifying presence of SPS/PPS NAL units using ffprobe ---")
+    try:
+        # This command will output packet information, including NAL unit types.
+        ffprobe_cmd = [
+            'ffprobe', '-v', 'error', '-show_packets',
+            '-select_streams', 'v:0', path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True, encoding='utf-8')
+        
+        output_text = result.stdout
+
+        # Check if the output contains lines indicating SPS (type 7) and PPS (type 8) NAL units.
+        sps_found = "nal_unit_type=7" in output_text
+        pps_found = "nal_unit_type=8" in output_text
+
+        if sps_found and pps_found:
+            print("  [✓] SUCCESS: Both SPS and PPS NAL units were found in the stream.")
+            return True
+        else:
+            if not sps_found:
+                print("  [✗] FAILURE: SPS (Sequence Parameter Set) NAL unit not found.", file=sys.stderr)
+            if not pps_found:
+                print("  [✗] FAILURE: PPS (Picture Parameter Set) NAL unit not found.", file=sys.stderr)
+            print("      The stream may be incomplete or corrupt.", file=sys.stderr)
+            return False
+
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"  [✗] ERROR: Could not run ffprobe to check for NAL units: {e}", file=sys.stderr)
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"      ffprobe stderr: {e.stderr}", file=sys.stderr)
+        return False
+
 def _contains_mvc_nal_units(path):
     """
     Scans a binary file for the presence of MVC-specific NAL unit headers.
@@ -162,6 +200,77 @@ def _verify_yuv_difference(left_yuv_path, right_yuv_path):
         print(f"  [✗] ERROR: Could not read YUV files for verification: {e}", file=sys.stderr)
         return False
 
+def _verify_plausible_bitrate(file_path, properties):
+    """
+    Performs a sanity check on the final stream's average bitrate.
+    A very low bitrate can indicate that the MVC dependent view was not encoded.
+    """
+    print("\n--- Verifying plausible bitrate of final stream ---")
+    try:
+        file_size_bytes = os.path.getsize(file_path)
+        duration_sec = properties.get('duration_seconds')
+
+        if not duration_sec or duration_sec == 0:
+            print("  [!] WARNING: Could not determine video duration. Skipping bitrate check.")
+            return True
+
+        bitrate_mbps = (file_size_bytes * 8) / (duration_sec * 1_000_000)
+        
+        # A typical 3D Blu-ray stream should have a healthy bitrate.
+        # A very low value (e.g., < 15 Mbps) for a CQP 22 encode is suspicious
+        # and may indicate that only the base view was encoded.
+        MIN_BITRATE_MBPS = 15.0
+
+        print(f"  [i] Calculated average bitrate: {bitrate_mbps:.2f} Mbps")
+
+        if bitrate_mbps < MIN_BITRATE_MBPS:
+            print(f"  [!] WARNING: Average bitrate is below {MIN_BITRATE_MBPS} Mbps. This might indicate an issue with the 3D encode.")
+        else:
+            print("  [✓] Bitrate seems plausible for a 3D Blu-ray stream.")
+        return True
+    except (IOError, KeyError) as e:
+        print(f"  [✗] ERROR: Could not perform bitrate verification: {e}", file=sys.stderr)
+        return False
+
+def _verify_sei_nal_units(path):
+    """
+    Scans the stream for SEI NAL units to confirm timing info is present.
+    This is a strong indicator that VuiNalHrd and PicTimingSEI were enabled.
+    """
+    print("\n--- Verifying for SEI NAL units in combined stream ---")
+    try:
+        stream = ConstBitStream(filename=path)
+        
+        # Find all NAL start codes (0x000001)
+        nal_unit_starts = stream.findall('0x000001', bytealigned=True)
+        
+        sei_units_found = 0
+        for start_pos in nal_unit_starts:
+            # Position the stream right after the start code
+            stream.pos = start_pos + 24 # 24 bits for the start code
+            
+            # Read the NAL header (1 byte)
+            if stream.pos + 8 > stream.len:
+                continue # Not enough data
+            
+            nal_header = stream.read(8)
+            # forbidden_zero_bit (1), nal_ref_idc (2), nal_unit_type (5)
+            nal_unit_type = nal_header.uint & 0x1F
+            
+            if nal_unit_type == 6: # SEI (Supplemental enhancement information)
+                sei_units_found += 1
+        
+        if sei_units_found > 0:
+            print(f"  [✓] SUCCESS: Found {sei_units_found} SEI NAL units in the stream.")
+            return True
+        else:
+            print("  [!] WARNING: No SEI NAL units found. The stream may lack timing information needed for muxing.")
+            return True # Non-fatal warning
+
+    except Exception as e: # Catch potential bitstring errors or file errors
+        print(f"  [✗] ERROR: Could not perform SEI NAL unit check: {e}", file=sys.stderr)
+        return False
+
 def create_3d_video_streams(source_file, properties, output_dir):
     """
     Creates Blu-ray 3D compliant streams by processing the video in chunks
@@ -190,8 +299,8 @@ def create_3d_video_streams(source_file, properties, output_dir):
 
     # --- Main processing loop ---
     num_chunks = (total_frames + CHUNK_SIZE_FRAMES - 1) // CHUNK_SIZE_FRAMES
-    base_chunk_files = []
-    combined_chunk_files = []
+    base_chunk_files = [] # For the left eye (AVC)
+    dep_chunk_files = []  # For the right eye (MVC)
 
     # Initialize the log file for this encoding session
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -210,8 +319,10 @@ def create_3d_video_streams(source_file, properties, output_dir):
         # Define temporary file paths for this specific chunk
         left_chunk_yuv = os.path.join(output_dir, f'temp_chunk_{i}_left.yuv')
         right_chunk_yuv = os.path.join(output_dir, f'temp_chunk_{i}_right.yuv')
-        combined_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_combined.264')
-        combined_chunk_files.append(combined_chunk_264)
+        base_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_base.264')
+        dep_chunk_264 = os.path.join(output_dir, f'temp_chunk_{i}_dep.264')
+        base_chunk_files.append(base_chunk_264)
+        dep_chunk_files.append(dep_chunk_264)
         try:
             # --- Step 1: Extract YUV chunks with ffmpeg ---
             ffmpeg_cmd_left = [
@@ -251,12 +362,12 @@ def create_3d_video_streams(source_file, properties, output_dir):
             frim_cmd = [
                 'FRIMEncode64',
                 '-i', left_chunk_yuv, right_chunk_yuv,
-                '-o:mvc', combined_chunk_264, # A single output file containing both views
+                '-o:mvc', base_chunk_264, dep_chunk_264,
+                '-viewoutput', # Explicitly create separate files for base and dependent views
                 '-w', '1920', '-h', '1080', 
                 # Use decimal representation for framerate to ensure consistency
                 # between the encoder and the muxer, preventing conflicts.
                 '-f', f"{fps_float:.3f}",
-                '-sw',
                 '-cqp', '22', '22', '22',
                 '-profile', 'high',
                 '-level', '4.1',
@@ -292,15 +403,15 @@ def create_3d_video_streams(source_file, properties, output_dir):
                 for issue in frame_issues:
                     print(f"      - {issue.strip()}")
 
-            if "Encoder MVC" not in frim_output:
-                print("  [✗] FATAL: FRIMEncode did not report entering MVC mode. The output is not 3D.", file=sys.stderr)
-                raise IOError("FRIMEncode failed to create an MVC stream.")
-
             # --- Verify chunk creation ---
-            if not os.path.exists(combined_chunk_264) or os.path.getsize(combined_chunk_264) == 0:
+            if not os.path.exists(base_chunk_264) or os.path.getsize(base_chunk_264) == 0:
                 print(f"  [✗] FATAL: FRIMEncode failed to create a valid output chunk for chunk {i+1}.", file=sys.stderr)
-                print(f"      Expected file: {combined_chunk_264}", file=sys.stderr)
+                print(f"      Expected file: {base_chunk_264}", file=sys.stderr)
                 raise IOError("FRIMEncode chunk creation failed.")
+            if not os.path.exists(dep_chunk_264) or os.path.getsize(dep_chunk_264) == 0:
+                print(f"  [✗] FATAL: FRIMEncode failed to create a valid dependent view chunk for chunk {i+1}.", file=sys.stderr)
+                print(f"      Expected file: {dep_chunk_264}", file=sys.stderr)
+                raise IOError("FRIMEncode dependent view chunk creation failed.")
 
         except (subprocess.CalledProcessError, FileNotFoundError, IOError) as e:
             # Provide a more specific error message for non-zero exit codes
@@ -318,22 +429,39 @@ def create_3d_video_streams(source_file, properties, output_dir):
                     os.remove(f)
     
     # --- Step 3 (Post-Loop): Concatenate chunks into final streams ---
-    print("\n--- Concatenating all chunks into a final combined 3D stream ---")
-    final_combined_path = os.path.join(output_dir, 'video_3d.264')
-    _concatenate_chunks(combined_chunk_files, final_combined_path)
+    print("\n--- Concatenating all chunks into final base and dependent streams ---")
+    final_base_path = os.path.join(output_dir, 'left_eye.264')
+    _concatenate_chunks(base_chunk_files, final_base_path)
+    final_dep_path = os.path.join(output_dir, 'right_eye.264')
+    _concatenate_chunks(dep_chunk_files, final_dep_path)
 
     # --- Final Verification ---
+    # Verify that the essential SPS and PPS NAL units are present.
+    if not _verify_sps_pps_presence(final_base_path):
+        print("Aborting due to missing essential NAL units (SPS/PPS).", file=sys.stderr)
+        sys.exit(1)
+
     # A critical check to ensure the encoder actually produced an MVC stream.
-    if not _contains_mvc_nal_units(final_combined_path):
+    if not _contains_mvc_nal_units(final_dep_path):
         print("Aborting due to MVC NAL unit verification failure.", file=sys.stderr)
         sys.exit(1)
 
-    # The most reliable verification for the combined stream is tsMuxeR itself.
-    # We will simply verify the base view properties within the combined stream.
-    if not _verify_stream_with_ffprobe(final_combined_path, "combined 3D stream (base view properties)"):
+    # Perform a bitrate sanity check as a heuristic for output size.
+    if not _verify_plausible_bitrate(final_base_path, properties):
+        # This is not a fatal error, but we should note it.
+        print("  [!] Bitrate verification step failed to execute.", file=sys.stderr)
+
+    # Check for SEI NAL units as an indicator of timing information
+    if not _verify_sei_nal_units(final_base_path):
+        # This is not a fatal error, but we should note it.
+        print("  [!] SEI NAL unit verification step failed to execute.", file=sys.stderr)
+
+    # Verify the base view stream with ffprobe and do a simple existence check on the dependent view.
+    if not _verify_stream_with_ffprobe(final_base_path, "left eye (base view)"):
         print("Aborting due to stream verification failure.", file=sys.stderr)
         sys.exit(1)
+    _verify_stream_with_ffprobe(final_dep_path, "right eye (dependent view)", is_dependent_view=True)
 
     print("\n--- 3D streams created successfully! ---")
-    print(f"You can find the final combined .264 file in: {output_dir}")
+    print(f"You can find the final .264 files in: {output_dir}")
     print("\nEncoding complete. Proceeding to muxing stage...")
