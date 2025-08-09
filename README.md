@@ -130,3 +130,25 @@ For troubleshooting, the script generates detailed log files in the temporary wo
 ## Known Limitations
 
 - **FRIMEncode on non-Intel Systems**: `FRIMEncode` is part of the Intel Media SDK. While it has a software fallback, its ability to create MVC streams on non-Intel (e.g., AMD) CPUs is not guaranteed and has been observed to fail. The script is most reliable when run on a system with an Intel CPU.
+
+##  Hardware requirement
+
+You’ll need an Intel CPU with integrated graphics that still supports Quick Sync MVC encoding — specifically:
+	-	10th Gen Intel Core or older (Comet Lake, Coffee Lake, Kaby Lake, Skylake, Haswell, Ivy Bridge, Sandy Bridge).
+	-	MVC support was dropped after 10th Gen in Intel’s hardware encoder, so anything newer won’t work.
+
+If you’re unsure, check your CPU’s Intel Ark page — MVC is part of Intel® Quick Sync Video – Multi-View Codec (MVC).
+
+## Software requirements
+
+Intel Media SDK Requirements
+	-	Intel Media SDK version 21.3.5 is the last known release that reliably supports MVC encoding in both software and hardware‐accelerated modes on Windows
+
+For Gen 10 and older CPUs, you want the latest Intel graphics driver version that still has MVC hooks.
+	-	For most Gen 10 iGPUs, that’s in the 27.20.100.8xxx–27.20.100.9xxx range (2020–early 2021 era).
+
+# Final Conclusion
+
+So, in summary — yes, you can still get MVC working with FRIM… but you’ll need an Intel CPU from the past, a graphics driver from 2020, and the last Media SDK before MVC got sent to the retirement home.
+
+At that point, you might as well borrow Doc Brown’s DeLorean, hit 88 mph, and bring along 1.21 gigawatts of power — because you’re basically time-traveling back to when MVC encoding was still a thing and 3D blu rays were still popular.
