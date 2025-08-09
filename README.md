@@ -2,6 +2,18 @@
 
 An automated pipeline for converting 3D Side-by-Side (SBS) video files into fully compliant Blu-ray 3D (BDMV or ISO) structures.
 
+## Introduction: A Proof of Concept for a Deprecated Workflow
+
+This project was created to provide a fully scripted, command-line-driven workflow for converting 3D side-by-side (SBS) video files into fully compliant, frame-packed Blu-ray 3D ISOs. It functions as a proof of concept, automating a chain of powerful tools (ffmpeg, FRIMencode64, tsmuxer) to achieve a goal that has long been a challenge for home media enthusiasts.
+
+## IMPORTANT: This script will no longer work on modern, updated Windows systems.
+
+The workflow's critical component is the hardware-accelerated H.264 MVC (Multiview Video Coding) encoding step, which was handled by sample_encode.exe, a tool compiled from the legacy Intel Media SDK.
+Our recent deep-dive analysis has confirmed that this foundational technology is now obsolete. Intel has officially discontinued the Media SDK and replaced it with the modern oneAPI Video Processing Library (oneVPL). During this transition, support for the niche MVC encoding feature was completely removed from the GPU runtime for modern processors (11th/12th Gen and newer).
+Consequently, the latest Intel Graphics Drivers—which are essential for modern hardware—no longer contain the necessary implementation to execute MVC encoding tasks. Any attempt to run sample_encode.exe for this purpose on an updated system will fail, as the driver-level support it depends on no longer exists.
+Therefore, this repository should be viewed as an archive and a technical demonstration of a workflow that was once viable. The code remains as a reference, but it is no longer functional due to the irreversible evolution of the underlying hardware and software ecosystem.
+
+
 ## Overview
 
 This project addresses the complex and often manual process of creating a proper 3D Blu-ray from common 3D video formats (like those found online). It provides a guided, step-by-step workflow that automates video analysis, 3D encoding, audio/subtitle track selection, and final muxing into a playable disc format.
