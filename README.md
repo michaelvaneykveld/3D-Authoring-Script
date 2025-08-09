@@ -8,9 +8,9 @@ This project was created to provide a fully scripted, command-line-driven workfl
 
 ## IMPORTANT: This script will no longer work on modern, updated Windows systems.
 
-The workflow's critical component is the hardware-accelerated H.264 MVC (Multiview Video Coding) encoding step, which was handled by sample_encode.exe, a tool compiled from the legacy Intel Media SDK.
+The workflow's critical component is the hardware-accelerated H.264 MVC (Multiview Video Coding) encoding step, which was handled by FRIMencode64.exe, a tool compiled from the legacy Intel Media SDK.
 Our recent deep-dive analysis has confirmed that this foundational technology is now obsolete. Intel has officially discontinued the Media SDK and replaced it with the modern oneAPI Video Processing Library (oneVPL). During this transition, support for the niche MVC encoding feature was completely removed from the GPU runtime for modern processors (11th/12th Gen and newer).
-Consequently, the latest Intel Graphics Drivers—which are essential for modern hardware—no longer contain the necessary implementation to execute MVC encoding tasks. Any attempt to run sample_encode.exe for this purpose on an updated system will fail, as the driver-level support it depends on no longer exists.
+Consequently, the latest Intel Graphics Drivers—which are essential for modern hardware—no longer contain the necessary implementation to execute MVC encoding tasks. Any attempt to run FRIMencode64 for this purpose on an updated system will fail, as the driver-level support it depends on no longer exists.
 Therefore, this repository should be viewed as an archive and a technical demonstration of a workflow that was once viable. The code remains as a reference, but it is no longer functional due to the irreversible evolution of the underlying hardware and software ecosystem.
 
 
